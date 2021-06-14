@@ -1,0 +1,23 @@
+#pragma once
+
+const int default_colors[] = {
+    0x0C0C0C,
+    0xC50F1F,
+    0x13A10E,
+    0xC19C00,
+    0x0037DA,
+    0x881798,
+    0x3A96DD,
+    0xCCCCCC,
+    0x767676,
+    0xE74856,
+    0x16C60C,
+    0xF9F1A5,
+    0x3B78FF,
+    0xB4009E,
+    0x61D6D6,
+    0xF2F2F2
+};
+
+const int default_bg_color = 0x000000;
+const int default_fg_color = 0xFFFFFF;

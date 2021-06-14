@@ -144,6 +144,7 @@
     <ClCompile Include="handterm.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="colors.h" />
     <ClInclude Include="condefs.h" />
     <ClInclude Include="condrv.h" />
     <ClInclude Include="conmsgl1.h" />

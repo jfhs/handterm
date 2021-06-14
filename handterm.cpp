@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include "condefs.h"
+#include "colors.h"
 
 #define Assert(cond) do { if (!(cond)) __debugbreak(); } while (0)
 #define AssertHR(hr) Assert(SUCCEEDED(hr))
@@ -33,8 +34,6 @@ HANDLE ServerHandle, ReferenceHandle, InputEventHandle;
 #define MAX_WIDTH 4096
 #define MAX_HEIGHT 4096
 
-static int termColor = 0xffffff;
-static int termBackg = 0x000000;
 static int termH = 1;
 static int termW = 1;
 
@@ -46,13 +45,18 @@ ULONG output_console_mode = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
 COORD cursor_pos = { 0 };
 COORD size = { 100, 20 };
 
+typedef struct CharAttributes {
+    int color;
+    int backg;
+};
+
 typedef struct TermChar
 {
     int ch;
-    int color;
-    int backg;
+    CharAttributes attr;
 } TermChar;
 static TermChar terminal[MAX_WIDTH * MAX_HEIGHT];
+CharAttributes current_attrs = { 0xffffff, 0 };
 
 INPUT_RECORD pending_events[256];
 volatile PINPUT_RECORD pending_events_write_ptr = pending_events;
@@ -162,10 +166,9 @@ void FastFast_UpdateTerminalW(const wchar_t* str, SIZE_T count)
                 int b = num(s);
 
                 if (fg) {
-                    termColor = r | (g << 8) | (b << 16);
-                }
-                else {
-                    termBackg = r | (g << 8) | (b << 16);
+                    current_attrs.color = r | (g << 8) | (b << 16);
+                } else {
+                    current_attrs.backg = r | (g << 8) | (b << 16);
                 }
             }
             str += pos + 1;
@@ -199,8 +202,21 @@ void FastFast_UpdateTerminalW(const wchar_t* str, SIZE_T count)
             if (overwrite) {
                 TermChar* t = &terminal[cursor_pos.Y * size.X + cursor_pos.X];
                 t->ch = ' ';
-                t->color = termColor;
-                t->backg = termBackg;
+                t->attr = current_attrs;
+            }
+            str++;
+            count--;
+        }
+        else if (str[0] == L'\r') {
+            cursor_pos.X = 0;
+            str++;
+            count--;
+        }
+        else if (str[0] == L'\n') {
+            cursor_pos.X = 0;
+            cursor_pos.Y++;
+            if (cursor_pos.Y >= size.Y) {
+                scroll_up(cursor_pos.Y - size.Y + 1);
             }
             str++;
             count--;
@@ -215,11 +231,10 @@ void FastFast_UpdateTerminalW(const wchar_t* str, SIZE_T count)
             {
                 TermChar* t = &terminal[cursor_pos.Y * size.X + cursor_pos.X];
                 t->ch = *str;
-                t->color = termColor;
-                t->backg = termBackg;
+                t->attr = current_attrs;
 
                 cursor_pos.X++;
-                if (cursor_pos.X == size.X || t->ch == L'\n')
+                if (cursor_pos.X == size.X)
                 {
                     cursor_pos.X = 0;
                     cursor_pos.Y++;
@@ -264,10 +279,9 @@ void FastFast_UpdateTerminalA(const char* str, SIZE_T count)
                 int b = num(s);
 
                 if (fg) {
-                    termColor = r | (g << 8) | (b << 16);
-                }
-                else {
-                    termBackg = r | (g << 8) | (b << 16);
+                    current_attrs.color = r | (g << 8) | (b << 16);
+                } else {
+                    current_attrs.backg = r | (g << 8) | (b << 16);
                 }
             }
             str += pos + 1;
@@ -290,8 +304,7 @@ void FastFast_UpdateTerminalA(const char* str, SIZE_T count)
             if (overwrite) {
                 TermChar* t = &terminal[cursor_pos.Y * size.X + cursor_pos.X];
                 t->ch = ' ';
-                t->color = termColor;
-                t->backg = termBackg;
+                t->attr = current_attrs;
             }
             str++;
             count--;
@@ -306,8 +319,7 @@ void FastFast_UpdateTerminalA(const char* str, SIZE_T count)
             {
                 TermChar* t = &terminal[cursor_pos.Y * size.X + cursor_pos.X];
                 t->ch = *str;
-                t->color = termColor;
-                t->backg = termBackg;
+                t->attr = current_attrs;
 
                 cursor_pos.X++;
                 if (cursor_pos.X == size.X || t->ch == '\n')
@@ -341,6 +353,8 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
         buf_size = DEFAULT_BUF_SIZE;
     }
 
+    ULONG user_write_buffer_size = ReceiveMsg->Descriptor.OutputSize - ReceiveMsg->msgHeader.ApiDescriptorSize;
+
     // todo: these can now be modified/read by 3 threads, probably should lock :|
     PINPUT_RECORD write_ptr = pending_events_write_ptr;
     PINPUT_RECORD read_ptr = pending_events_read_ptr;
@@ -370,7 +384,7 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                     buf_bytes_written += read_msg->Unicode ? 2 : 1;
                     // without line mode we can return any amount of data
                     // and we should also stop reading as soon as we have enough data in buffer
-                    if (buf_bytes_written && (buf_bytes_written > buf_size || buf_bytes_written > read_msg->NumBytes)) {
+                    if (buf_bytes_written && (buf_bytes_written > buf_size || buf_bytes_written > user_write_buffer_size)) {
                         break;
                     }
                     if (read_msg->Unicode) {
@@ -378,6 +392,9 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                     } else {
                         buf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.AsciiChar;
                     }
+                }
+                if (++read_ptr == pending_events_wrap_ptr) {
+                    read_ptr = pending_events;
                 }
             }
 
@@ -490,7 +507,7 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
             }
             // if we got here, we eitehr got CR or there was some data from previous line read request
             size_t bytes_left = buf_bytes_written - buf_bytes_read;
-            ULONG bytes_to_write = min(bytes_left, read_msg->NumBytes);
+            ULONG bytes_to_write = min(bytes_left, user_write_buffer_size);
             write_op.Buffer.Data = buf + buf_bytes_read;
             write_op.Buffer.Size = bytes_to_write;
         }
@@ -513,6 +530,38 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
     }
 }
 
+HRESULT HandleWriteMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_complete) {
+    DWORD BytesRead = 0;
+    HRESULT hr;
+    BOOL ok;
+
+    PCONSOLE_WRITECONSOLE_MSG write_msg = &ReceiveMsg->u.consoleMsgL1.WriteConsoleW; // this WriteConsole macro...
+    size_t read_offset = ReceiveMsg->msgHeader.ApiDescriptorSize + sizeof(CONSOLE_MSG_HEADER);
+    size_t bytes = ReceiveMsg->Descriptor.InputSize - read_offset;
+    if (buf_size < bytes) {
+        buf = (char*)realloc(buf, bytes);
+        buf_size = bytes;
+    }
+    CD_IO_OPERATION read_op = { 0 };
+    read_op.Identifier = ReceiveMsg->Descriptor.Identifier;
+    read_op.Buffer.Offset = read_offset;
+    read_op.Buffer.Data = buf;
+    read_op.Buffer.Size = bytes;
+    ok = DeviceIoControl(ServerHandle, IOCTL_CONDRV_READ_INPUT, &read_op, sizeof(read_op), 0, 0, &BytesRead, 0);
+    hr = ok ? S_OK : GetLastError();
+    Assert(SUCCEEDED(hr));
+    FastFast_LockTerminal();
+    if (write_msg->Unicode) {
+        FastFast_UpdateTerminalW((wchar_t*)buf, bytes / 2);
+    } else {
+        FastFast_UpdateTerminalA(buf, bytes);
+    }
+    FastFast_UnlockTerminal();
+
+    io_complete->IoStatus.Information = write_msg->NumBytes = bytes;
+    return STATUS_SUCCESS;
+}
+
 DWORD WINAPI DelayedIoThread(LPVOID lpParameter)
 {
     DWORD BytesRead = 0;
@@ -532,6 +581,7 @@ DWORD WINAPI DelayedIoThread(LPVOID lpParameter)
         io_complete.Write.Size = delayed_io_msg.msgHeader.ApiDescriptorSize;
 
         switch (delayed_io_msg.Descriptor.Function) {
+        case CONSOLE_IO_RAW_READ: // we setup api number to correct one
         case CONSOLE_IO_USER_DEFINED: {
             ULONG const LayerNumber = (delayed_io_msg.msgHeader.ApiNumber >> 24) - 1;
             ULONG const ApiNumber = delayed_io_msg.msgHeader.ApiNumber & 0xffffff;
@@ -642,7 +692,7 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
             io_complete.Write.Size = sizeof(connect_info);
             ok = DeviceIoControl(ServerHandle, IOCTL_CONDRV_COMPLETE_IO, &io_complete, sizeof(io_complete), 0, 0, &BytesRead, 0);
             hr = ok ? S_OK : GetLastError();
-            Assert(SUCCEEDED(hr));            
+            Assert(SUCCEEDED(hr));
 
             break;
         }
@@ -654,6 +704,54 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
             ConsoleOwner.ProcessId = GetCurrentProcessId();
             ConsoleOwner.ThreadId = GetCurrentThreadId();
             _ConsoleControl(ConsoleSetWindowOwner, &ConsoleOwner, sizeof(ConsoleOwner));
+            break;
+        }
+        case CONSOLE_IO_CREATE_OBJECT: {
+            send_io_complete = true;
+            PCD_CREATE_OBJECT_INFORMATION const CreateInformation = &ReceiveMsg.CreateObject;
+            HANDLE handle = INVALID_HANDLE_VALUE;
+            if (CreateInformation->ObjectType == CD_IO_OBJECT_TYPE_CURRENT_INPUT) {
+                handle = 0;
+            } else if (CreateInformation->ObjectType == CD_IO_OBJECT_TYPE_CURRENT_OUTPUT) {
+                handle = (HANDLE)1;
+            } else {
+                // not supported yet
+            }
+            io_complete.IoStatus.Status = handle == INVALID_HANDLE_VALUE ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
+            io_complete.IoStatus.Information = (ULONG)handle;
+            break;
+        }
+        case CONSOLE_IO_RAW_READ:
+        {
+            send_io_complete = true;
+            ZeroMemory(&ReceiveMsg.u.consoleMsgL1.ReadConsoleW, sizeof(CONSOLE_READCONSOLE_MSG));
+            ReceiveMsg.msgHeader.ApiNumber = 0x01000005; // ReadConsole
+            ReceiveMsg.msgHeader.ApiDescriptorSize = 0;
+            hr = HandleReadMessage(&ReceiveMsg, &io_complete);
+            if (hr == STATUS_TIMEOUT) {
+                send_io_complete = false;
+                delayed_io_msg = ReceiveMsg;
+                has_delayed_io_msg = true;
+            } else {
+                io_complete.IoStatus.Status = hr;
+            }
+            break;
+        }
+        case CONSOLE_IO_RAW_WRITE:
+        {
+            send_io_complete = true;
+            ZeroMemory(&ReceiveMsg.u.consoleMsgL1.WriteConsoleW, sizeof(CONSOLE_WRITECONSOLE_MSG));
+            ReceiveMsg.msgHeader.ApiNumber = 0x01000006; // WriteConsole
+            ReceiveMsg.msgHeader.ApiDescriptorSize = 0;
+            hr = HandleWriteMessage(&ReceiveMsg, &io_complete);
+            /*
+            if (hr == STATUS_TIMEOUT) {
+                send_io_complete = false;
+                delayed_io_msg = ReceiveMsg;
+                has_delayed_io_msg = true;
+            } else {*/
+                io_complete.IoStatus.Status = hr;
+            //}
             break;
         }
         case CONSOLE_IO_USER_DEFINED: {
@@ -693,32 +791,15 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                     break;
                 }
                 case Api_WriteConsole: {
-                    PCONSOLE_WRITECONSOLE_MSG write_msg = &ReceiveMsg.u.consoleMsgL1.WriteConsoleW; // this WriteConsole macro...
-                    size_t read_offset = ReceiveMsg.msgHeader.ApiDescriptorSize + sizeof(CONSOLE_MSG_HEADER);
-                    size_t bytes = ReceiveMsg.Descriptor.InputSize - read_offset;
-                    if (buf_size < bytes) {
-                        buf = (char*)realloc(buf, bytes);
-                        buf_size = bytes;
-                    }
-                    CD_IO_OPERATION read_op = { 0 };
-                    read_op.Identifier = ReceiveMsg.Descriptor.Identifier;
-                    read_op.Buffer.Offset = read_offset;
-                    read_op.Buffer.Data = buf;
-                    read_op.Buffer.Size = bytes;
-                    ok = DeviceIoControl(ServerHandle, IOCTL_CONDRV_READ_INPUT, &read_op, sizeof(read_op), 0, 0, &BytesRead, 0);
-                    hr = ok ? S_OK : GetLastError();
-                    Assert(SUCCEEDED(hr));
-                    FastFast_LockTerminal();
-                    if (write_msg->Unicode) {
-                        FastFast_UpdateTerminalW((wchar_t*)buf, bytes / 2);
+                    hr = HandleWriteMessage(&ReceiveMsg, &io_complete);
+                    /*if (hr == STATUS_TIMEOUT) {
+                        send_io_complete = false;
+                        delayed_io_msg = ReceiveMsg;
+                        has_delayed_io_msg = true;
                     } else {
-                        FastFast_UpdateTerminalA(buf, bytes);
-                    }
-                    FastFast_UnlockTerminal();
-
-                    io_complete.IoStatus.Status = STATUS_SUCCESS;
-                    io_complete.IoStatus.Information = write_msg->NumBytes = bytes;
-
+                    */
+                        io_complete.IoStatus.Status = hr;
+                    // }
                     break;
                 }
                 case Api_GetConsoleInput: {
@@ -849,6 +930,21 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                     Assert(SUCCEEDED(hr));
 
                     console_title[bytes / 2] = 0;
+
+                    io_complete.IoStatus.Status = STATUS_SUCCESS;
+                    break;
+                }
+                case Api_SetConsoleTextAttribute: {
+                    CONSOLE_SETTEXTATTRIBUTE_MSG* set_attr_msg = &ReceiveMsg.u.consoleMsgL2.SetConsoleTextAttribute;
+                    char bg_idx = (set_attr_msg->Attributes >> 4) & 0xf;
+                    current_attrs.backg = bg_idx ? default_colors[bg_idx] : default_bg_color;
+                    char fg_idx = set_attr_msg->Attributes & 0xf;
+                    current_attrs.color = fg_idx ? default_colors[fg_idx] : default_fg_color;
+
+                    if (set_attr_msg->Attributes & META_ATTRS) {
+                        sprintf(dbg_buf, "Unhandled console attributes in reqeust %d\n", set_attr_msg->Attributes);
+                        OutputDebugStringA(dbg_buf);
+                    }
 
                     io_complete.IoStatus.Status = STATUS_SUCCESS;
                     break;
@@ -1439,7 +1535,7 @@ int WINAPI WinMain(
                 {
                     for (int x = 0; x < termW; x++)
                     {
-                        vtx = AddChar(vtx, (char)t->ch, x, y, t->color, t->backg);
+                        vtx = AddChar(vtx, (char)t->ch, x, y, t->attr.color, t->attr.backg);
                         t++;
                     }
                 }
