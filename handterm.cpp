@@ -171,6 +171,40 @@ void FastFast_UpdateTerminalW(const wchar_t* str, SIZE_T count)
             str += pos + 1;
             count -= pos + 1;
         }
+        // backspace
+        else if (str[0] == L'\b') {
+            bool overwrite = true;            
+            COORD backup_limit = { 0, 0 };
+            // todo: this should only be done for echoed input characters, not any backspace that app writes
+            if (input_console_mode & ENABLE_LINE_INPUT) {
+                backup_limit = line_input_saved_cursor;
+            }
+
+            if (!cursor_pos.X) {
+                if (cursor_pos.Y > backup_limit.Y) {
+                    --cursor_pos.Y;
+                    cursor_pos.X = size.X - 1;
+                } else {
+                    // nowhere to backup
+                    overwrite = false;
+                }
+            } else {
+                if (cursor_pos.Y > backup_limit.Y || cursor_pos.X > backup_limit.X) {
+                    cursor_pos.X--;
+                } else {
+                    // nowhere to backup
+                    overwrite = false;
+                }
+            }
+            if (overwrite) {
+                TermChar* t = &terminal[cursor_pos.Y * size.X + cursor_pos.X];
+                t->ch = ' ';
+                t->color = termColor;
+                t->backg = termBackg;
+            }
+            str++;
+            count--;
+        }
         else
         {
             // todo: also do that if cursor moves beyond and WRAP_AT_EOL_OUTPUT is enabled
@@ -239,6 +273,29 @@ void FastFast_UpdateTerminalA(const char* str, SIZE_T count)
             str += pos + 1;
             count -= pos + 1;
         }
+        // backspace
+        else if (str[0] == '\b') {
+            bool overwrite = true;
+            if (!cursor_pos.X) {
+                if (cursor_pos.Y) {
+                    --cursor_pos.Y;
+                    cursor_pos.X = size.X - 1;
+                } else {
+                    // nowhere to backup
+                    overwrite = false;
+                }
+            } else {
+                cursor_pos.X--;
+            }
+            if (overwrite) {
+                TermChar* t = &terminal[cursor_pos.Y * size.X + cursor_pos.X];
+                t->ch = ' ';
+                t->color = termColor;
+                t->backg = termBackg;
+            }
+            str++;
+            count--;
+        }
         else
         {
             // todo: also do that if cursor moves beyond and WRAP_AT_EOL_OUTPUT is enabled
@@ -265,13 +322,24 @@ void FastFast_UpdateTerminalA(const char* str, SIZE_T count)
     }
 }
 
+const size_t DEFAULT_BUF_SIZE = 128;
+
 thread_local char* buf = 0;
 thread_local size_t buf_size = 0;
+thread_local size_t buf_bytes_read = 0;
+thread_local size_t buf_bytes_written = 0;
+thread_local size_t buf_write_idx = 0;
 
 HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_complete) {
     DWORD BytesRead = 0;
     HRESULT hr;
     BOOL ok;
+
+    // todo: this should be part of thread initialization to avoid this check on every message
+    if (!buf_size) {
+        buf = (char*)malloc(DEFAULT_BUF_SIZE);
+        buf_size = DEFAULT_BUF_SIZE;
+    }
 
     // todo: these can now be modified/read by 3 threads, probably should lock :|
     PINPUT_RECORD write_ptr = pending_events_write_ptr;
@@ -284,82 +352,162 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
             return STATUS_UNSUCCESSFUL;
         }
 
-        size_t bytes = 0;
-        size_t buf_idx = 0;
-        bool has_cr = false;
         wchar_t* wbuf = (wchar_t*)buf;
+        // todo: mode should probably be copy-stored for delayed IO
         bool line_mode_enabled = input_console_mode & ENABLE_LINE_INPUT;
-        while (read_ptr != write_ptr) {
-            // it's expected that in this mode we just skip other events
-            if (read_ptr->EventType == KEY_EVENT && read_ptr->Event.KeyEvent.uChar.UnicodeChar) {
-                // todo: support repeat
-                Assert(read_ptr->Event.KeyEvent.wRepeatCount == 1);
-
-                bool is_cr;
-                if (read_msg->Unicode) {
-                    is_cr = read_ptr->Event.KeyEvent.uChar.UnicodeChar == L'\r';
-                } else {
-                    is_cr = read_ptr->Event.KeyEvent.uChar.AsciiChar == '\r';
-                }
-                has_cr |= is_cr;
-                bool will_add_lf = is_cr && line_mode_enabled;
-
-                bytes += (will_add_lf ? 2 : 1) * (read_msg->Unicode ? 2 : 1);
-                if (bytes > buf_size) {
-                    buf_size = max(buf_size, 128) * 2;
-                    buf = (char*)realloc(buf, buf_size);
-                    wbuf = (wchar_t*)buf;
-                }
-                if (read_msg->Unicode) {
-                    wbuf[buf_idx++] = read_ptr->Event.KeyEvent.uChar.UnicodeChar;
-                    if (will_add_lf) {
-                        wbuf[buf_idx++] = L'\n';
-                    }
-                } else {
-                    buf[buf_idx++] = read_ptr->Event.KeyEvent.uChar.AsciiChar;
-                    if (will_add_lf) {
-                        buf[buf_idx++] = '\n';
-                    }
-                }
-            }
-            if (++read_ptr == pending_events_wrap_ptr) {
-                read_ptr = pending_events;
-            }
-        }
-
-        if (bytes && (input_console_mode & ENABLE_ECHO_INPUT)) {
-            FastFast_LockTerminal();
-            cursor_pos = line_input_saved_cursor;
-            if (read_msg->Unicode) {
-                FastFast_UpdateTerminalW(wbuf, buf_idx);
-            }
-            else {
-                FastFast_UpdateTerminalA(buf, buf_idx);
-            }
-            FastFast_UnlockTerminal();
-        }
-
-        if (!bytes || (!has_cr && input_console_mode & ENABLE_LINE_INPUT)) {
-            return STATUS_TIMEOUT;
-        }
 
         CD_IO_OPERATION write_op = { 0 };
         write_op.Identifier = ReceiveMsg->Descriptor.Identifier;
         write_op.Buffer.Offset = ReceiveMsg->msgHeader.ApiDescriptorSize;
-        write_op.Buffer.Data = buf;
-        write_op.Buffer.Size = bytes;
+       
+        if (!line_mode_enabled) {  
+            while (read_ptr != write_ptr) {
+                // it's expected that in this mode we just skip other events
+                if (read_ptr->EventType == KEY_EVENT && read_ptr->Event.KeyEvent.uChar.UnicodeChar) {
+                    // todo: support repeat
+                    Assert(read_ptr->Event.KeyEvent.wRepeatCount == 1);
 
+                    buf_bytes_written += read_msg->Unicode ? 2 : 1;
+                    // without line mode we can return any amount of data
+                    // and we should also stop reading as soon as we have enough data in buffer
+                    if (buf_bytes_written && (buf_bytes_written > buf_size || buf_bytes_written > read_msg->NumBytes)) {
+                        break;
+                    }
+                    if (read_msg->Unicode) {
+                        wbuf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.UnicodeChar;
+                    } else {
+                        buf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.AsciiChar;
+                    }
+                }
+            }
+
+            // consume processed events no matter what
+            pending_events_read_ptr = read_ptr;
+            // todo: this is most likely not thread safe
+            if (pending_events_read_ptr == pending_events_write_ptr) {
+                ResetEvent(InputEventHandle);
+            }
+
+            if (!buf_bytes_written) {
+                return STATUS_TIMEOUT;
+            }
+            write_op.Buffer.Data = buf;
+            write_op.Buffer.Size = buf_bytes_written;
+        } else {
+            // no data available to read right away, buffer until we get CR
+            if (!buf_bytes_read) {
+                bool has_cr = false;
+                while (read_ptr != write_ptr) {
+                    // it's expected that in this mode we just skip other events
+                    if (read_ptr->EventType == KEY_EVENT && read_ptr->Event.KeyEvent.uChar.UnicodeChar) {
+                        // todo: support repeat
+                        Assert(read_ptr->Event.KeyEvent.wRepeatCount == 1);
+                        bool is_cr, is_removing;
+                        if (read_msg->Unicode) {
+                            is_cr = read_ptr->Event.KeyEvent.uChar.UnicodeChar == L'\r';
+                            is_removing = read_ptr->Event.KeyEvent.uChar.UnicodeChar == L'\b';
+                        } else {
+                            is_cr = read_ptr->Event.KeyEvent.uChar.AsciiChar == '\r';
+                            is_removing = read_ptr->Event.KeyEvent.uChar.UnicodeChar == '\b';
+                        }
+                        has_cr |= is_cr;
+
+                        if (is_removing) {
+                            // todo: support other chars
+                            if (read_ptr->Event.KeyEvent.uChar.UnicodeChar == L'\b') {
+                                if (buf_write_idx) {
+                                    buf_bytes_written -= read_msg->Unicode ? 2 : 1;
+                                    if (read_msg->Unicode) {
+                                        wbuf[buf_write_idx] = L' ';
+                                    } else {
+                                        buf[buf_write_idx] = ' ';
+                                    }
+                                    --buf_write_idx;
+                                } else {
+                                    // nothing to remove
+                                }
+                            }
+                        }
+                        else {
+                            buf_bytes_written += (is_cr ? 2 : 1) * (read_msg->Unicode ? 2 : 1);
+                            if (buf_bytes_written > buf_size) {
+                                buf_size = buf_size * 2;
+                                buf = (char*)realloc(buf, buf_size);
+                                wbuf = (wchar_t*)buf;
+                            }
+                            if (read_msg->Unicode) {
+                                wbuf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.UnicodeChar;
+                                if (is_cr) {
+                                    wbuf[buf_write_idx++] = L'\n';
+                                }
+                            } else {
+                                buf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.AsciiChar;
+                                if (is_cr) {
+                                    buf[buf_write_idx++] = '\n';
+                                }
+                            }
+                        }
+                    }
+                    if (++read_ptr == pending_events_wrap_ptr) {
+                        read_ptr = pending_events;
+                    }
+                    if (line_mode_enabled && has_cr) {
+                        break;
+                    }
+                }
+
+                // consume processed events no matter what
+                pending_events_read_ptr = read_ptr;
+                // todo: this is most likely not thread safe
+                if (pending_events_read_ptr == pending_events_write_ptr) {
+                    ResetEvent(InputEventHandle);
+                }
+
+                if (input_console_mode & ENABLE_ECHO_INPUT) {
+                    FastFast_LockTerminal();
+                    // todo: this is not super efficient way to do it, especially for things like backspace at EOL
+                    size_t backup_dist = (cursor_pos.Y - line_input_saved_cursor.Y) * size.X + cursor_pos.X - line_input_saved_cursor.X;
+                    for (size_t i = 0; i < backup_dist; ++i) {
+                        char backspace = '\b';
+                        FastFast_UpdateTerminalA(&backspace, 1);
+                    }
+                    cursor_pos = line_input_saved_cursor;
+                    if (read_msg->Unicode) {
+                        FastFast_UpdateTerminalW(wbuf, buf_write_idx);
+                    }
+                    else {
+                        FastFast_UpdateTerminalA(buf, buf_write_idx);
+                    }
+                    FastFast_UnlockTerminal();
+                }
+
+                if (!has_cr) {
+                    return STATUS_TIMEOUT;
+                }
+            }
+            if (!buf_bytes_written) {
+                return STATUS_TIMEOUT;
+            }
+            // if we got here, we eitehr got CR or there was some data from previous line read request
+            size_t bytes_left = buf_bytes_written - buf_bytes_read;
+            ULONG bytes_to_write = min(bytes_left, read_msg->NumBytes);
+            write_op.Buffer.Data = buf + buf_bytes_read;
+            write_op.Buffer.Size = bytes_to_write;
+        }
+        
         ok = DeviceIoControl(ServerHandle, IOCTL_CONDRV_WRITE_OUTPUT, &write_op, sizeof(write_op), 0, 0, &BytesRead, 0);
         hr = ok ? S_OK : GetLastError();
         Assert(SUCCEEDED(hr));
 
-        pending_events_read_ptr = read_ptr;
-        // todo: this is most likely not thread safe
-        if (pending_events_read_ptr == pending_events_write_ptr) {
-            ResetEvent(InputEventHandle);
+        buf_bytes_read += write_op.Buffer.Size;
+        // reset pointers after whole buffer was written to client
+        if (buf_bytes_read == buf_bytes_written) {
+            buf_bytes_read = 0;
+            buf_bytes_written = 0;
+            buf_write_idx = 0;
         }
 
-        io_complete->IoStatus.Information = read_msg->NumBytes = bytes;
+        io_complete->IoStatus.Information = read_msg->NumBytes = write_op.Buffer.Size;
     } else {
         return STATUS_TIMEOUT;
     }
@@ -373,7 +521,8 @@ DWORD WINAPI DelayedIoThread(LPVOID lpParameter)
     CD_IO_COMPLETE io_complete;
 
     while (!console_exit) {
-        WaitForSingleObject(delayed_io_event, INFINITE);
+        hr = WaitForSingleObject(delayed_io_event, INFINITE);
+        
         if (!has_delayed_io_msg) {
             continue;
         }
@@ -1170,6 +1319,7 @@ int WINAPI WinMain(
             continue;
         }
         if (events_added) {
+            events_added = false;
             SetEvent(delayed_io_event);
         }
 
