@@ -78,12 +78,14 @@ bool show_cursor = true;
 
 HRESULT PushEvent(INPUT_RECORD ev) {
     // buffer full
-    if (pending_events_write_ptr + 1 == pending_events_read_ptr) {
+    PINPUT_RECORD next = pending_events_write_ptr + 1;
+    if (next == pending_events_wrap_ptr)
+        next = pending_events;
+    if (next == pending_events_read_ptr) {
         return STATUS_UNSUCCESSFUL;
     }
     *pending_events_write_ptr = ev;
-    if (++pending_events_write_ptr == pending_events_wrap_ptr)
-        pending_events_write_ptr = pending_events;
+    pending_events_write_ptr = next;
     SetEvent(InputEventHandle);
     return STATUS_SUCCESS;
 }
