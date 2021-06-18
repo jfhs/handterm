@@ -124,6 +124,13 @@ inline TermChar* check_wrap(TermOutputBuffer* tb, TermChar* ptr) {
     return ptr;
 }
 
+inline TermChar* check_wrap_backwards(TermOutputBuffer* tb, TermChar* ptr) {
+    if (ptr < tb->buffer_start) {
+        return get_wrap_ptr(tb) - (tb->buffer_start - ptr);
+    }
+    return ptr;
+}
+
 HRESULT PushEvent(INPUT_RECORD ev) {
     // buffer full
     PINPUT_RECORD next = pending_events_write_ptr + 1;
@@ -171,6 +178,12 @@ void FastFast_Resize(SHORT width, SHORT height) {
     width = max(MIN_WIDTH, width);
     height = max(MIN_HEIGHT, height);
     FastFast_LockTerminal();
+
+    if (width == frontbuffer.size.X && height == frontbuffer.size.Y) {
+        FastFast_UnlockTerminal();
+        return;
+    }
+
     Assert(initialize_term_output_buffer(relayoutbuffer, { width, height }, true));
     COORD& cursor_pos = relayoutbuffer.cursor_pos;
     COORD mapped_cursor_pos = { 0, 0 };
@@ -182,10 +195,7 @@ void FastFast_Resize(SHORT width, SHORT height) {
     bool cursor_found = frontbuffer.cursor_pos.X == 0 && frontbuffer.cursor_pos.Y == 0;
     TermChar* last_ch_from_prev_row = 0;
     TermChar* frontbuffer_wrap = get_wrap_ptr(&frontbuffer);
-    TermChar* old_t = frontbuffer.buffer - frontbuffer.size.X * frontbuffer.scrollback_available;
-    if (old_t < frontbuffer.buffer_start) {
-        old_t = get_wrap_ptr(&frontbuffer) - (frontbuffer.buffer_start - old_t);
-    }
+    TermChar* old_t = check_wrap_backwards(&frontbuffer, frontbuffer.buffer - frontbuffer.size.X * frontbuffer.scrollback_available);
     bool first = true;
     for (int y = -(int)frontbuffer.scrollback_available; y < frontbuffer.size.Y; ++y) {
         // at each line that's not first, if last char on previous row doesn't have soft_wrap attribute set, we issue a new line
@@ -230,7 +240,7 @@ void FastFast_Resize(SHORT width, SHORT height) {
 
             if (cursor_pos.X == size.X)
             {
-                TermChar* prev_char = check_wrap(&relayoutbuffer, t - 1);
+                TermChar* prev_char = check_wrap_backwards(&relayoutbuffer, t - 1);
                 // todo: do we really need this check? if we ended-up here, that we _should_ have had previous char
                 if (prev_char->ch) {
                     prev_char->attr.soft_wrap = true;
