@@ -5,6 +5,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stddef.h>
 #include <intrin.h>
 #include <winternl.h>
@@ -49,11 +50,14 @@ typedef struct TermChar {
 } TermChar;
 
 typedef struct TermOutputBuffer {
-    TermChar* buffer;
-    size_t buf_size;
+    TermChar* buffer; // left top corner of actual console buffer, cursor_pos {0 0} is here
+    TermChar* buffer_start; // actual start of the allocated buffer
+    size_t buf_size; // size in bytes
     COORD cursor_pos;
     COORD line_input_saved_cursor;
     COORD size;
+    uint32_t scrollback_available; // number of lines of current width "above" buffer that are available. can wrap to the bottom ((char*)buffer_start + buf_size)
+    uint32_t scrollback; // this is "absolute" value, from buffer_start, NOT from buffer
 } TermOutputBuffer;
 
 TermOutputBuffer backbuffer = { 0 };
@@ -76,27 +80,43 @@ bool has_delayed_io_msg = false;
 HANDLE delayed_io_event;
 
 bool show_cursor = true;
+SHORT default_scrollback = 10;
 
 // END GLOBALS
 
 bool initialize_term_output_buffer(TermOutputBuffer& tb, COORD size, bool zeromem) {
-    size_t requested_size = size.X * size.Y * sizeof(tb.buffer[0]);
+    size_t requested_size = size.X * (size.Y + default_scrollback) * sizeof(tb.buffer[0]);
     if (tb.buf_size < requested_size) {
-        TermChar* new_buf = (TermChar*)realloc(tb.buffer, requested_size);
+        TermChar* new_buf = (TermChar*)realloc(tb.buffer_start, requested_size);
         if (new_buf) {
             ZeroMemory(new_buf, requested_size);
-            tb.buffer = new_buf;
+            tb.buffer_start = new_buf;
             tb.buf_size = requested_size;
         } else {
             return false;
         }
     } else if (zeromem) {
-        ZeroMemory(tb.buffer, requested_size);
+        ZeroMemory(tb.buffer_start, requested_size);
     }
+    tb.buffer = tb.buffer_start;
     tb.cursor_pos = { 0 };
     tb.line_input_saved_cursor = { 0 };
+    tb.scrollback_available = 0;
+    tb.scrollback = 0;
     tb.size = size;
     return true;
+}
+
+inline TermChar* get_wrap_ptr(TermOutputBuffer* tb) {
+    return tb->buffer_start + tb->size.X * (tb->size.Y + default_scrollback);
+}
+
+inline TermChar* check_wrap(TermOutputBuffer* tb, TermChar* ptr) {
+    TermChar* wrap_ptr = get_wrap_ptr(tb);
+    if (ptr >= wrap_ptr) {
+        return tb->buffer_start + (ptr - wrap_ptr);
+    }
+    return ptr;
 }
 
 HRESULT PushEvent(INPUT_RECORD ev) {
@@ -114,14 +134,16 @@ HRESULT PushEvent(INPUT_RECORD ev) {
 }
 
 void FastFast_LockTerminal() {
-    WaitForSingleObject(console_mutex, INFINITE);
+    HRESULT hr = WaitForSingleObject(console_mutex, INFINITE);
+    Assert(hr == WAIT_OBJECT_0);
 }
 void FastFast_UnlockTerminal() {
     ReleaseMutex(console_mutex);
 }
 
 void lock_back_buffer() {
-    WaitForSingleObject(back_buffer_mutex, INFINITE);
+    HRESULT hr = WaitForSingleObject(back_buffer_mutex, INFINITE);
+    Assert(hr == WAIT_OBJECT_0);
 }
 void unlock_back_buffer() {
     ReleaseMutex(back_buffer_mutex);
@@ -129,9 +151,12 @@ void unlock_back_buffer() {
 
 void copy_front_buf_to_back() {
     Assert(initialize_term_output_buffer(backbuffer, frontbuffer.size, false));
-    memcpy(backbuffer.buffer, frontbuffer.buffer, sizeof(frontbuffer.buffer[0]) * frontbuffer.size.X * frontbuffer.size.Y);
+    memcpy(backbuffer.buffer_start, frontbuffer.buffer_start, frontbuffer.size.X * (frontbuffer.size.Y + frontbuffer.scrollback_available) * sizeof(TermChar));
     backbuffer.cursor_pos = frontbuffer.cursor_pos;
     backbuffer.line_input_saved_cursor = frontbuffer.line_input_saved_cursor;
+    backbuffer.scrollback_available = frontbuffer.scrollback_available;
+    backbuffer.buffer = backbuffer.buffer_start + (frontbuffer.buffer - frontbuffer.buffer_start);
+    backbuffer.scrollback = frontbuffer.scrollback;
 }
 
 void swap_output_buffers() {
@@ -148,8 +173,23 @@ void swap_output_buffers() {
 
 void scroll_up(TermOutputBuffer& tb, UINT lines) {
     tb.cursor_pos.Y -= lines;
-    memmove(tb.buffer, tb.buffer + lines * tb.size.X, tb.size.X * (tb.size.Y - lines) * sizeof(tb.buffer[0]));
-    ZeroMemory(tb.buffer + tb.size.X * (tb.size.Y - lines), lines * tb.size.X * sizeof(tb.buffer[0]));
+    tb.scrollback_available = min(default_scrollback, tb.scrollback_available + lines);
+    if (tb.scrollback) {
+        if (++tb.scrollback > tb.scrollback_available) {
+            tb.scrollback = tb.scrollback_available;
+        }
+    }
+
+    tb.buffer = check_wrap(&tb, tb.buffer + tb.size.X * lines);
+    TermChar* zeroing_start = check_wrap(&tb, tb.buffer + tb.size.X * (tb.size.Y - lines));
+    TermChar* screen_end = check_wrap(&tb, tb.buffer + tb.size.X * tb.size.Y);
+    // if no wrap
+    if (screen_end >= zeroing_start) {
+        ZeroMemory(zeroing_start, (char*)screen_end - (char*)zeroing_start);
+    } else {
+        ZeroMemory(zeroing_start, (char*)get_wrap_ptr(&tb) - (char*)zeroing_start);
+        ZeroMemory(tb.buffer, (char*)screen_end - (char*)tb.buffer_start);
+    }
 }
 
 void FastFast_Resize(SHORT width, SHORT height) {
@@ -161,10 +201,18 @@ void FastFast_Resize(SHORT width, SHORT height) {
     // consider found if it's 0 0
     bool line_input_cursor_found = backbuffer.line_input_saved_cursor.X == 0 && backbuffer.line_input_saved_cursor.Y == 0;
     TermChar* last_ch_from_prev_row = 0;
-    for (int y = 0; y < backbuffer.size.Y; ++y) {
+    TermChar* backbuffer_wrap = get_wrap_ptr(&backbuffer);
+    TermChar* old_t = backbuffer.buffer - backbuffer.size.X * backbuffer.scrollback_available;
+    if (old_t < backbuffer.buffer_start) {
+        old_t = get_wrap_ptr(&backbuffer) - (backbuffer.buffer_start - old_t);
+    }
+    bool first = true;
+    for (int y = -(int)backbuffer.scrollback_available; y < backbuffer.size.Y; ++y) {
         // at each line that's not first, if last char on previous row doesn't have soft_wrap attribute set, we issue a new line
-        if (y) {
-            TermChar* old_t = &backbuffer.buffer[y * backbuffer.size.X];
+        if (!first) {
+            if (old_t == backbuffer_wrap) {
+                old_t = backbuffer.buffer_start;
+            }
             if (!old_t->ch) {
                 // empty lines might have zero charachters "printed" (non-zero ch), in general
                 // we could just not check ch, but in the beginning, there might be lines that were never printed
@@ -179,6 +227,8 @@ void FastFast_Resize(SHORT width, SHORT height) {
                     scroll_up(relayoutbuffer, cursor_pos.Y - size.Y + 1);
                 }
             }
+        } else {
+            first = false;
         }
         last_ch_from_prev_row = 0;
         for (int x = 0; x < backbuffer.size.X; ++x) {
@@ -186,10 +236,9 @@ void FastFast_Resize(SHORT width, SHORT height) {
                 relayoutbuffer.line_input_saved_cursor = cursor_pos;
                 line_input_cursor_found = true;
             }
-
-            TermChar* old_t = &backbuffer.buffer[y * backbuffer.size.X + x];
-            TermChar* t = &relayoutbuffer.buffer[cursor_pos.Y * size.X + cursor_pos.X];
+            TermChar* t = check_wrap(&relayoutbuffer, relayoutbuffer.buffer + cursor_pos.Y * size.X + cursor_pos.X);
             if (!old_t->ch) {
+                old_t += backbuffer.size.X - x;
                 // end of line
                 break;
             }
@@ -197,7 +246,7 @@ void FastFast_Resize(SHORT width, SHORT height) {
 
             if (cursor_pos.X == size.X)
             {
-                TermChar* prev_char = t - 1;
+                TermChar* prev_char = check_wrap(&relayoutbuffer, t - 1);
                 // todo: do we really need this check? if we ended-up here, that we _should_ have had previous char
                 if (prev_char->ch) {
                     prev_char->attr.soft_wrap = true;
@@ -208,11 +257,13 @@ void FastFast_Resize(SHORT width, SHORT height) {
             }
             if (cursor_pos.Y >= size.Y) {
                 scroll_up(relayoutbuffer, cursor_pos.Y - size.Y + 1);
-                t = &relayoutbuffer.buffer[cursor_pos.Y * size.X + cursor_pos.X];
+                t = check_wrap(&relayoutbuffer, relayoutbuffer.buffer + cursor_pos.Y * size.X + cursor_pos.X);
             }
             *t = *old_t;
             t->attr.soft_wrap = false;
             cursor_pos.X++;
+
+            old_t++;
         }
     }
     // should be always true
@@ -320,7 +371,7 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
                 }
             }
             if (overwrite) {
-                TermChar* t = &tb.buffer[cursor_pos.Y * size.X + cursor_pos.X];
+                TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
                 t->ch = ' ';
                 t->attr = current_attrs;
             }
@@ -349,7 +400,7 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
             }
             if (cursor_pos.X >= 0 && cursor_pos.X < size.X && cursor_pos.Y >= 0 && cursor_pos.Y < size.Y)
             {
-                TermChar* t = &tb.buffer[cursor_pos.Y * size.X + cursor_pos.X];
+                TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
                 t->ch = *str;
                 t->attr = current_attrs;
 
@@ -433,7 +484,7 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
                 }
             }
             if (overwrite) {
-                TermChar* t = &tb.buffer[cursor_pos.Y * size.X + cursor_pos.X];
+                TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
                 t->ch = ' ';
                 t->attr = current_attrs;
             }
@@ -459,7 +510,7 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
             }
             if (cursor_pos.X >= 0 && cursor_pos.X < size.X && cursor_pos.Y >= 0 && cursor_pos.Y < size.Y)
             {
-                TermChar* t = &tb.buffer[cursor_pos.Y * size.X + cursor_pos.X];
+                TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
                 t->ch = *str;
                 t->attr = current_attrs;
 
@@ -1119,15 +1170,53 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
     return 0;
 }
 
-static LRESULT CALLBACK WindowProc(HWND wnd, UINT msg, WPARAM wparam, LPARAM lparam)
+static LRESULT CALLBACK WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
     {
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
+    case WM_VSCROLL:
+        {
+            FastFast_LockTerminal();
+            switch (LOWORD(wParam)) {
+            case SB_BOTTOM: {
+                frontbuffer.scrollback = 0;
+                break;
+            }
+            case SB_LINEDOWN: {
+                if (frontbuffer.scrollback)
+                    --frontbuffer.scrollback;
+                break;
+            }
+            case SB_LINEUP: {
+                if (frontbuffer.scrollback < frontbuffer.scrollback_available)
+                    ++frontbuffer.scrollback;
+                break;
+            }
+            case SB_PAGEDOWN: {
+                frontbuffer.scrollback = max(0, frontbuffer.scrollback - frontbuffer.size.Y);
+                break;
+            }
+            case SB_PAGEUP: {
+                frontbuffer.scrollback = min(frontbuffer.scrollback_available, frontbuffer.scrollback + frontbuffer.size.Y);
+                break;
+            }
+            case SB_THUMBTRACK: {
+                frontbuffer.scrollback = max(0, min(frontbuffer.scrollback_available, frontbuffer.scrollback_available - HIWORD(wParam)));
+                char dbg_buf[256] = { 0 };
+                sprintf(dbg_buf, "Thumbtrack event, wparam.hi=%d scrollback=%d\n", HIWORD(wParam), frontbuffer.scrollback);
+                OutputDebugStringA(dbg_buf);
+
+                break;
+            }
+            }
+            FastFast_UnlockTerminal();
+            return 0;
+        }
     }
-    return DefWindowProcW(wnd, msg, wparam, lparam);
+    return DefWindowProcW(wnd, msg, wParam, lParam);
 }
 
 static IDXGISwapChain* swapChain;
@@ -1174,9 +1263,6 @@ static Vertex* AddChar(Vertex* vtx, char ch, int x, int y, int color, int backg)
 void SetupConsoleAndProcess() 
 {
     DWORD RetBytes = 0, err;
-    console_mutex = CreateMutex(0, false, L"ConsoleMutex");
-    back_buffer_mutex = CreateMutex(0, false, L"BackBufferMutex");
-    Assert(console_mutex);
 
     _NtOpenFile = (PfnNtOpenFile)GetProcAddress(LoadLibraryExW(L"ntdll.dll", 0, LOAD_LIBRARY_SEARCH_SYSTEM32), "NtOpenFile");
     _ConsoleControl = (PfnConsoleControl)GetProcAddress(LoadLibraryExW(L"user32.dll", 0, LOAD_LIBRARY_SEARCH_SYSTEM32), "ConsoleControl");
@@ -1263,7 +1349,7 @@ int WINAPI WinMain(
 
     // window properties - width, height and style
     DWORD exstyle = WS_EX_APPWINDOW;
-    DWORD style = WS_OVERLAPPEDWINDOW;
+    DWORD style = WS_OVERLAPPEDWINDOW | WS_VSCROLL;
 
     HWND window = CreateWindowExW(exstyle, wc.lpszClassName, L"Handterm", style, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, wc.hInstance, NULL);
     Assert(window);
@@ -1515,6 +1601,11 @@ int WINAPI WinMain(
     bool events_added = false;
     MSG keydown_msg;
 
+    console_mutex = CreateMutex(0, false, L"ConsoleMutex");
+    back_buffer_mutex = CreateMutex(0, false, L"BackBufferMutex");
+    Assert(console_mutex);
+    Assert(back_buffer_mutex);
+
     // setup terminal dimensions here so that process already can write out correctly
     RECT rect;
     GetClientRect(window, &rect);
@@ -1527,6 +1618,7 @@ int WINAPI WinMain(
     while(!console_exit)
     {
         MSG msg;
+        OutputDebugStringA("Peekmsg");
         if (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
         {
             if (msg.message == WM_QUIT)
@@ -1560,6 +1652,10 @@ int WINAPI WinMain(
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+
+            char dbg_buf[256];
+            sprintf(dbg_buf, "Got message %d", msg.message);
+            OutputDebugStringA(dbg_buf);
             continue;
         }
         if (events_added) {
@@ -1671,8 +1767,18 @@ int WINAPI WinMain(
                     }
                 }
 #else
+                OutputDebugStringA("getting lock\n");
                 FastFast_LockTerminal();
-                TermChar* t = frontbuffer.buffer;
+                OutputDebugStringA("Rendering\n");
+                SCROLLINFO si = { 0 };
+                si.cbSize = sizeof(si);
+                si.fMask = SIF_ALL;
+                si.nMin = 0;
+                si.nMax = frontbuffer.scrollback_available;
+                si.nPos = frontbuffer.scrollback_available - frontbuffer.scrollback;
+                SetScrollInfo(window, SB_VERT, &si, true);
+                TermChar* t = check_wrap(&frontbuffer, frontbuffer.buffer - frontbuffer.size.X * frontbuffer.scrollback);
+                TermChar* t_wrap = get_wrap_ptr(&frontbuffer);
                 for (int y = 0; y < frontbuffer.size.Y; y++)
                 {
                     for (int x = 0; x < frontbuffer.size.X; x++)
@@ -1680,9 +1786,12 @@ int WINAPI WinMain(
                         vtx = AddChar(vtx, (char)t->ch, x, y, t->attr.color, t->attr.backg);
                         t++;
                     }
+                    if (t >= t_wrap) {
+                        t = frontbuffer.buffer_start;
+                    }
                 }
                 if (show_cursor) {
-                    vtx = AddChar(vtx, 0xdb, frontbuffer.cursor_pos.X, frontbuffer.cursor_pos.Y, 0xffffff, 0);
+                    vtx = AddChar(vtx, 0xdb, frontbuffer.cursor_pos.X, frontbuffer.cursor_pos.Y + frontbuffer.scrollback, 0xffffff, 0);
                 }
                 FastFast_UnlockTerminal();
 #endif
