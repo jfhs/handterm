@@ -30,10 +30,16 @@ PfnNtOpenFile _NtOpenFile;
 PfnConsoleControl _ConsoleControl;
 
 // GLOBALS
+HWND window;
+HANDLE window_ready_event;
 HANDLE console_mutex;
 HANDLE ServerHandle, ReferenceHandle, InputEventHandle;
 #define MAX_WIDTH 4096
 #define MAX_HEIGHT 4096
+
+// in terminal size
+#define MIN_WIDTH 32
+#define MIN_HEIGHT 16
 
 ULONG input_console_mode = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_MOUSE_INPUT | ENABLE_INSERT_MODE | ENABLE_EXTENDED_FLAGS | ENABLE_AUTO_POSITION;
 ULONG output_console_mode = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
@@ -162,6 +168,8 @@ void scroll_up(TermOutputBuffer& tb, UINT lines) {
 }
 
 void FastFast_Resize(SHORT width, SHORT height) {
+    width = max(MIN_WIDTH, width);
+    height = max(MIN_HEIGHT, height);
     FastFast_LockTerminal();
     Assert(initialize_term_output_buffer(relayoutbuffer, { width, height }, true));
     COORD& cursor_pos = relayoutbuffer.cursor_pos;
@@ -1290,13 +1298,7 @@ void SetupConsoleAndProcess()
     CloseHandle(ClientHandles[2]);
 }
 
-int WINAPI WinMain(
-    _In_ HINSTANCE hInstance,
-    _In_opt_ HINSTANCE hPrevInstance,
-    _In_ LPSTR lpCmdLine,
-    _In_ int nShowCmd
-)
-{
+DWORD WINAPI WindowThread(LPVOID lpParameter) {
     WNDCLASSEXW wc = { 0 };
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WindowProc;
@@ -1311,10 +1313,79 @@ int WINAPI WinMain(
     DWORD exstyle = WS_EX_APPWINDOW;
     DWORD style = WS_OVERLAPPEDWINDOW | WS_VSCROLL;
 
-    HWND window = CreateWindowExW(exstyle, wc.lpszClassName, L"Handterm", style, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, wc.hInstance, NULL);
+    window = CreateWindowExW(exstyle, wc.lpszClassName, L"Handterm", style, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, wc.hInstance, NULL);
     Assert(window);
+    // show the window
+    ShowWindow(window, SW_SHOWDEFAULT);
+    SetFocus(window);
 
+    SetEvent(window_ready_event);
+
+    bool events_added = false;
+    MSG keydown_msg;
+    while (!console_exit) {
+        MSG msg;
+        // OutputDebugStringA("Peekmsg");
+        if (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+        {
+            if (msg.message == WM_QUIT)
+            {
+                break;
+            }
+            if (msg.message == WM_KEYDOWN)
+            {
+                keydown_msg = msg;
+                INPUT_RECORD key_event;
+                key_event.EventType = KEY_EVENT;
+                key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(keydown_msg.wParam);
+                key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
+                key_event.Event.KeyEvent.bKeyDown = true;
+                key_event.Event.KeyEvent.wRepeatCount = LOWORD(msg.lParam);
+                key_event.Event.KeyEvent.uChar.UnicodeChar = 0;
+                PushEvent(key_event);
+                events_added = true;
+            }
+            if (msg.message == WM_CHAR)
+            {
+                INPUT_RECORD key_event;
+                key_event.EventType = KEY_EVENT;
+                key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(keydown_msg.wParam);
+                key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
+                key_event.Event.KeyEvent.bKeyDown = true;
+                key_event.Event.KeyEvent.wRepeatCount = LOWORD(msg.lParam);
+                key_event.Event.KeyEvent.uChar.UnicodeChar = msg.wParam;
+                PushEvent(key_event);
+                events_added = true;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+
+            char dbg_buf[256];
+            //sprintf(dbg_buf, "Got message %d", msg.message);
+            //OutputDebugStringA(dbg_buf);
+            continue;
+        }
+        if (events_added) {
+            events_added = false;
+            SetEvent(delayed_io_event);
+        }
+        Sleep(10);
+    }
+    return 0;
+}
+
+int WINAPI WinMain(
+    _In_ HINSTANCE hInstance,
+    _In_opt_ HINSTANCE hPrevInstance,
+    _In_ LPSTR lpCmdLine,
+    _In_ int nShowCmd
+)
+{
     HRESULT hr;
+
+    window_ready_event = CreateEventExW(0, 0, 0, EVENT_ALL_ACCESS);
+    CreateThread(0, 0, WindowThread, 0, 0, 0);
+    WaitForSingleObject(window_ready_event, INFINITE);
 
     // create swap chain, device and context
     {
@@ -1546,9 +1617,6 @@ int WINAPI WinMain(
         AssertHR(hr);
     }
 
-    // show the window
-    ShowWindow(window, SW_SHOWDEFAULT);
-
     LARGE_INTEGER freq, time;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&time);
@@ -1575,52 +1643,6 @@ int WINAPI WinMain(
 
     while(!console_exit)
     {
-        MSG msg;
-        // OutputDebugStringA("Peekmsg");
-        if (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
-        {
-            if (msg.message == WM_QUIT)
-            {
-                break;
-            }
-            if (msg.message == WM_KEYDOWN) 
-            {
-                keydown_msg = msg;
-                INPUT_RECORD key_event;
-                key_event.EventType = KEY_EVENT;
-                key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(keydown_msg.wParam);
-                key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
-                key_event.Event.KeyEvent.bKeyDown = true;
-                key_event.Event.KeyEvent.wRepeatCount = LOWORD(msg.lParam);
-                key_event.Event.KeyEvent.uChar.UnicodeChar = 0;
-                PushEvent(key_event);
-                events_added = true;
-            }
-            if (msg.message == WM_CHAR)
-            {
-                INPUT_RECORD key_event;
-                key_event.EventType = KEY_EVENT;
-                key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(keydown_msg.wParam);
-                key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
-                key_event.Event.KeyEvent.bKeyDown = true;
-                key_event.Event.KeyEvent.wRepeatCount = LOWORD(msg.lParam);
-                key_event.Event.KeyEvent.uChar.UnicodeChar = msg.wParam;
-                PushEvent(key_event);
-                events_added = true;
-            }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-
-            char dbg_buf[256];
-            //sprintf(dbg_buf, "Got message %d", msg.message);
-            //OutputDebugStringA(dbg_buf);
-            continue;
-        }
-        if (events_added) {
-            events_added = false;
-            SetEvent(delayed_io_event);
-        }
-
         RECT rect;
         GetClientRect(window, &rect);
         DWORD width = rect.right - rect.left;
@@ -1725,9 +1747,8 @@ int WINAPI WinMain(
                     }
                 }
 #else
-                //OutputDebugStringA("getting lock\n");
-                FastFast_LockTerminal();
-                //OutputDebugStringA("Rendering\n");
+                // may set incorrect values since it's done without lock, 
+                // but it can't be under lock since then we can deadlock with DefWindowProc
                 SCROLLINFO si = { 0 };
                 si.cbSize = sizeof(si);
                 si.fMask = SIF_ALL;
@@ -1735,6 +1756,8 @@ int WINAPI WinMain(
                 si.nMax = frontbuffer.scrollback_available;
                 si.nPos = frontbuffer.scrollback_available - frontbuffer.scrollback;
                 SetScrollInfo(window, SB_VERT, &si, true);
+
+                FastFast_LockTerminal();
                 TermChar* t = check_wrap(&frontbuffer, frontbuffer.buffer - frontbuffer.size.X * frontbuffer.scrollback);
                 TermChar* t_wrap = get_wrap_ptr(&frontbuffer);
                 for (int y = 0; y < frontbuffer.size.Y; y++)
@@ -1758,6 +1781,8 @@ int WINAPI WinMain(
                 context->Unmap(vbuffer, 0);
             }
 
+            float clear_color[4] = { 0, 0, 0, 1 };
+            context->ClearRenderTargetView(rtView, clear_color);
             context->IASetInputLayout(layout);
             context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             UINT stride = sizeof(struct Vertex);
