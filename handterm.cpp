@@ -1151,8 +1151,22 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                     sprintf(dbg_buf, "Unhandled L2 request %d\n", ApiNumber);
                     OutputDebugStringA(dbg_buf);
                 }
+            } else if (LayerNumber == 2) {
+                CONSOLE_L3_API_TYPE l3_type = (CONSOLE_L3_API_TYPE)ApiNumber;
+                switch (l3_type) {
+                case Api_GetConsoleWindow: {
+                    CONSOLE_GETCONSOLEWINDOW_MSG* get_hwnd_msg = &ReceiveMsg.u.consoleMsgL3.GetConsoleWindow;
+                    get_hwnd_msg->hwnd = window;
+                    io_complete.IoStatus.Status = STATUS_SUCCESS;
+                    break;
+                }
+                default:
+                    sprintf(dbg_buf, "Unhandled L3 request %d\n", ApiNumber);
+                    OutputDebugStringA(dbg_buf);
+                    break;
+                }
             } else {
-                sprintf(dbg_buf, "Unhandled L3 request %d\n", ApiNumber);
+                sprintf(dbg_buf, "Unhandled unknown layer %d request %d\n", LayerNumber, ApiNumber);
                 OutputDebugStringA(dbg_buf);
             }
             break;

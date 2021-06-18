@@ -190,28 +190,3 @@ typedef enum CONSOLE_L1_API_TYPE {
     Api_GetConsoleLangId,
     Api_ConsoleMapBitmap
 } CONSOLE_L1_API_TYPE;
-
-typedef enum CONSOLE_L2_API_TYPE {
-    Api_FillConsoleOutput,
-    Api_GenerateConsoleCtrlEvent,
-    Api_SetConsoleActiveScreenBuffer,
-    Api_FlushConsoleInputBuffer,
-    Api_SetConsoleCP,
-    Api_GetConsoleCursorInfo,
-    Api_SetConsoleCursorInfo,
-    Api_GetConsoleScreenBufferInfo,
-    Api_SetConsoleScreenBufferInfo,
-    Api_SetConsoleScreenBufferSize,
-    Api_SetConsoleCursorPosition,
-    Api_GetLargestConsoleWindowSize,
-    Api_ScrollConsoleScreenBuffer,
-    Api_SetConsoleTextAttribute,
-    Api_SetConsoleWindowInfo,
-    Api_ReadConsoleOutputString,
-    Api_WriteConsoleInput,
-    Api_WriteConsoleOutput,
-    Api_WriteConsoleOutputString,
-    Api_ReadConsoleOutput,
-    Api_GetConsoleTitle,
-    Api_SetConsoleTitle,
-} CONSOLE_L2_API_TYPE;
