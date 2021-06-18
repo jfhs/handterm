@@ -30,7 +30,7 @@ PfnNtOpenFile _NtOpenFile;
 PfnConsoleControl _ConsoleControl;
 
 // GLOBALS
-HANDLE console_mutex, back_buffer_mutex;
+HANDLE console_mutex;
 HANDLE ServerHandle, ReferenceHandle, InputEventHandle;
 #define MAX_WIDTH 4096
 #define MAX_HEIGHT 4096
@@ -60,7 +60,6 @@ typedef struct TermOutputBuffer {
     uint32_t scrollback; // this is "absolute" value, from buffer_start, NOT from buffer
 } TermOutputBuffer;
 
-TermOutputBuffer backbuffer = { 0 };
 TermOutputBuffer frontbuffer = { 0 };
 TermOutputBuffer relayoutbuffer = { 0 };
 
@@ -141,36 +140,6 @@ void FastFast_UnlockTerminal() {
     ReleaseMutex(console_mutex);
 }
 
-void lock_back_buffer() {
-    HRESULT hr = WaitForSingleObject(back_buffer_mutex, INFINITE);
-    Assert(hr == WAIT_OBJECT_0);
-}
-void unlock_back_buffer() {
-    ReleaseMutex(back_buffer_mutex);
-}
-
-void copy_front_buf_to_back() {
-    Assert(initialize_term_output_buffer(backbuffer, frontbuffer.size, false));
-    memcpy(backbuffer.buffer_start, frontbuffer.buffer_start, frontbuffer.size.X * (frontbuffer.size.Y + frontbuffer.scrollback_available) * sizeof(TermChar));
-    backbuffer.cursor_pos = frontbuffer.cursor_pos;
-    backbuffer.line_input_saved_cursor = frontbuffer.line_input_saved_cursor;
-    backbuffer.scrollback_available = frontbuffer.scrollback_available;
-    backbuffer.buffer = backbuffer.buffer_start + (frontbuffer.buffer - frontbuffer.buffer_start);
-    backbuffer.scrollback = frontbuffer.scrollback;
-}
-
-void swap_output_buffers() {
-    HANDLE handles[2] = { console_mutex, back_buffer_mutex };
-    WaitForMultipleObjects(2, handles, true, INFINITE);
-    TermOutputBuffer temp = frontbuffer;
-    frontbuffer = backbuffer;
-    backbuffer = temp;
-    copy_front_buf_to_back();
-
-    ReleaseMutex(console_mutex);
-    ReleaseMutex(back_buffer_mutex);
-}
-
 void scroll_up(TermOutputBuffer& tb, UINT lines) {
     tb.cursor_pos.Y -= lines;
     tb.scrollback_available = min(default_scrollback, tb.scrollback_available + lines);
@@ -188,30 +157,30 @@ void scroll_up(TermOutputBuffer& tb, UINT lines) {
         ZeroMemory(zeroing_start, (char*)screen_end - (char*)zeroing_start);
     } else {
         ZeroMemory(zeroing_start, (char*)get_wrap_ptr(&tb) - (char*)zeroing_start);
-        ZeroMemory(tb.buffer, (char*)screen_end - (char*)tb.buffer_start);
+        ZeroMemory(tb.buffer_start, (char*)screen_end - (char*)tb.buffer_start);
     }
 }
 
 void FastFast_Resize(SHORT width, SHORT height) {
-    lock_back_buffer();
+    FastFast_LockTerminal();
     Assert(initialize_term_output_buffer(relayoutbuffer, { width, height }, true));
     COORD& cursor_pos = relayoutbuffer.cursor_pos;
     COORD size = relayoutbuffer.size;
     int empty_lines = 0;
     // consider found if it's 0 0
-    bool line_input_cursor_found = backbuffer.line_input_saved_cursor.X == 0 && backbuffer.line_input_saved_cursor.Y == 0;
+    bool line_input_cursor_found = frontbuffer.line_input_saved_cursor.X == 0 && frontbuffer.line_input_saved_cursor.Y == 0;
     TermChar* last_ch_from_prev_row = 0;
-    TermChar* backbuffer_wrap = get_wrap_ptr(&backbuffer);
-    TermChar* old_t = backbuffer.buffer - backbuffer.size.X * backbuffer.scrollback_available;
-    if (old_t < backbuffer.buffer_start) {
-        old_t = get_wrap_ptr(&backbuffer) - (backbuffer.buffer_start - old_t);
+    TermChar* frontbuffer_wrap = get_wrap_ptr(&frontbuffer);
+    TermChar* old_t = frontbuffer.buffer - frontbuffer.size.X * frontbuffer.scrollback_available;
+    if (old_t < frontbuffer.buffer_start) {
+        old_t = get_wrap_ptr(&frontbuffer) - (frontbuffer.buffer_start - old_t);
     }
     bool first = true;
-    for (int y = -(int)backbuffer.scrollback_available; y < backbuffer.size.Y; ++y) {
+    for (int y = -(int)frontbuffer.scrollback_available; y < frontbuffer.size.Y; ++y) {
         // at each line that's not first, if last char on previous row doesn't have soft_wrap attribute set, we issue a new line
         if (!first) {
-            if (old_t == backbuffer_wrap) {
-                old_t = backbuffer.buffer_start;
+            if (old_t == frontbuffer_wrap) {
+                old_t = frontbuffer.buffer_start;
             }
             if (!old_t->ch) {
                 // empty lines might have zero charachters "printed" (non-zero ch), in general
@@ -231,14 +200,14 @@ void FastFast_Resize(SHORT width, SHORT height) {
             first = false;
         }
         last_ch_from_prev_row = 0;
-        for (int x = 0; x < backbuffer.size.X; ++x) {
-            if (x == backbuffer.line_input_saved_cursor.X && y == backbuffer.line_input_saved_cursor.Y) {
+        for (int x = 0; x < frontbuffer.size.X; ++x) {
+            if (x == frontbuffer.line_input_saved_cursor.X && y == frontbuffer.line_input_saved_cursor.Y) {
                 relayoutbuffer.line_input_saved_cursor = cursor_pos;
                 line_input_cursor_found = true;
             }
             TermChar* t = check_wrap(&relayoutbuffer, relayoutbuffer.buffer + cursor_pos.Y * size.X + cursor_pos.X);
             if (!old_t->ch) {
-                old_t += backbuffer.size.X - x;
+                old_t += frontbuffer.size.X - x;
                 // end of line
                 break;
             }
@@ -268,12 +237,9 @@ void FastFast_Resize(SHORT width, SHORT height) {
     }
     // should be always true
     Assert(line_input_cursor_found);
-    TermOutputBuffer temp = backbuffer;
-    backbuffer = relayoutbuffer;
+    TermOutputBuffer temp = frontbuffer;
+    frontbuffer = relayoutbuffer;
     relayoutbuffer = temp;
-    unlock_back_buffer();
-
-    swap_output_buffers();
 
     INPUT_RECORD resize_event = {};
     resize_event.EventType = WINDOW_BUFFER_SIZE_EVENT;
@@ -675,22 +641,20 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                 }
 
                 if (input_console_mode & ENABLE_ECHO_INPUT) {
-                    lock_back_buffer();
+                    FastFast_LockTerminal();
                     // todo: this is not super efficient way to do it, especially for things like backspace at EOL
-                    size_t backup_dist = (backbuffer.cursor_pos.Y - backbuffer.line_input_saved_cursor.Y) * backbuffer.size.X + backbuffer.cursor_pos.X - backbuffer.line_input_saved_cursor.X;
+                    size_t backup_dist = (frontbuffer.cursor_pos.Y - frontbuffer.line_input_saved_cursor.Y) * frontbuffer.size.X + frontbuffer.cursor_pos.X - frontbuffer.line_input_saved_cursor.X;
                     for (size_t i = 0; i < backup_dist; ++i) {
                         char backspace = '\b';
-                        FastFast_UpdateTerminalA(backbuffer, &backspace, 1);
+                        FastFast_UpdateTerminalA(frontbuffer, &backspace, 1);
                     }
-                    backbuffer.cursor_pos = backbuffer.line_input_saved_cursor;
+                    frontbuffer.cursor_pos = frontbuffer.line_input_saved_cursor;
                     if (read_msg->Unicode) {
-                        FastFast_UpdateTerminalW(backbuffer, wbuf, buf_write_idx);
+                        FastFast_UpdateTerminalW(frontbuffer, wbuf, buf_write_idx);
                     } else {
-                        FastFast_UpdateTerminalA(backbuffer, buf, buf_write_idx);
+                        FastFast_UpdateTerminalA(frontbuffer, buf, buf_write_idx);
                     }
-                    unlock_back_buffer();
-
-                    swap_output_buffers();
+                    FastFast_UnlockTerminal();
                 }
 
                 if (!has_cr) {
@@ -746,16 +710,12 @@ HRESULT HandleWriteMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_compl
     hr = ok ? S_OK : GetLastError();
     Assert(SUCCEEDED(hr));
 
-    lock_back_buffer();
-    if (write_msg->Unicode) {
-        FastFast_UpdateTerminalW(backbuffer, (wchar_t*)buf, bytes / 2);
-    } else {
-        FastFast_UpdateTerminalA(backbuffer, buf, bytes);
-    }
-    unlock_back_buffer();
-
     FastFast_LockTerminal();
-    swap_output_buffers();
+    if (write_msg->Unicode) {
+        FastFast_UpdateTerminalW(frontbuffer, (wchar_t*)buf, bytes / 2);
+    } else {
+        FastFast_UpdateTerminalA(frontbuffer, buf, bytes);
+    }
     FastFast_UnlockTerminal();
 
     io_complete->IoStatus.Information = write_msg->NumBytes = bytes;
@@ -1048,7 +1008,7 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                 case Api_ReadConsole: {
                     if (input_console_mode & ENABLE_LINE_INPUT) {
                         FastFast_LockTerminal();
-                        backbuffer.line_input_saved_cursor = backbuffer.cursor_pos;
+                        frontbuffer.line_input_saved_cursor = frontbuffer.cursor_pos;
                         FastFast_UnlockTerminal();
                     }
                     hr = HandleReadMessage(&ReceiveMsg, &io_complete);
@@ -1602,9 +1562,7 @@ int WINAPI WinMain(
     MSG keydown_msg;
 
     console_mutex = CreateMutex(0, false, L"ConsoleMutex");
-    back_buffer_mutex = CreateMutex(0, false, L"BackBufferMutex");
     Assert(console_mutex);
-    Assert(back_buffer_mutex);
 
     // setup terminal dimensions here so that process already can write out correctly
     RECT rect;
@@ -1618,7 +1576,7 @@ int WINAPI WinMain(
     while(!console_exit)
     {
         MSG msg;
-        OutputDebugStringA("Peekmsg");
+        // OutputDebugStringA("Peekmsg");
         if (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
         {
             if (msg.message == WM_QUIT)
@@ -1654,8 +1612,8 @@ int WINAPI WinMain(
             DispatchMessageW(&msg);
 
             char dbg_buf[256];
-            sprintf(dbg_buf, "Got message %d", msg.message);
-            OutputDebugStringA(dbg_buf);
+            //sprintf(dbg_buf, "Got message %d", msg.message);
+            //OutputDebugStringA(dbg_buf);
             continue;
         }
         if (events_added) {
@@ -1767,9 +1725,9 @@ int WINAPI WinMain(
                     }
                 }
 #else
-                OutputDebugStringA("getting lock\n");
+                //OutputDebugStringA("getting lock\n");
                 FastFast_LockTerminal();
-                OutputDebugStringA("Rendering\n");
+                //OutputDebugStringA("Rendering\n");
                 SCROLLINFO si = { 0 };
                 si.cbSize = sizeof(si);
                 si.fMask = SIF_ALL;
