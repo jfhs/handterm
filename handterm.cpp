@@ -173,10 +173,13 @@ void FastFast_Resize(SHORT width, SHORT height) {
     FastFast_LockTerminal();
     Assert(initialize_term_output_buffer(relayoutbuffer, { width, height }, true));
     COORD& cursor_pos = relayoutbuffer.cursor_pos;
+    COORD mapped_cursor_pos = { 0, 0 };
     COORD size = relayoutbuffer.size;
+    relayoutbuffer.line_input_saved_cursor = { 0, 0 };
     int empty_lines = 0;
     // consider found if it's 0 0
     bool line_input_cursor_found = frontbuffer.line_input_saved_cursor.X == 0 && frontbuffer.line_input_saved_cursor.Y == 0;
+    bool cursor_found = frontbuffer.cursor_pos.X == 0 && frontbuffer.cursor_pos.Y == 0;
     TermChar* last_ch_from_prev_row = 0;
     TermChar* frontbuffer_wrap = get_wrap_ptr(&frontbuffer);
     TermChar* old_t = frontbuffer.buffer - frontbuffer.size.X * frontbuffer.scrollback_available;
@@ -209,9 +212,13 @@ void FastFast_Resize(SHORT width, SHORT height) {
         }
         last_ch_from_prev_row = 0;
         for (int x = 0; x < frontbuffer.size.X; ++x) {
-            if (x == frontbuffer.line_input_saved_cursor.X && y == frontbuffer.line_input_saved_cursor.Y) {
+            if (!line_input_cursor_found && x == frontbuffer.line_input_saved_cursor.X && y == frontbuffer.line_input_saved_cursor.Y) {
                 relayoutbuffer.line_input_saved_cursor = cursor_pos;
                 line_input_cursor_found = true;
+            }
+            if (!cursor_found && x == frontbuffer.cursor_pos.X && y == frontbuffer.cursor_pos.Y) {
+                mapped_cursor_pos = cursor_pos;
+                cursor_found = true;
             }
             TermChar* t = check_wrap(&relayoutbuffer, relayoutbuffer.buffer + cursor_pos.Y * size.X + cursor_pos.X);
             if (!old_t->ch) {
@@ -245,6 +252,8 @@ void FastFast_Resize(SHORT width, SHORT height) {
     }
     // should be always true
     Assert(line_input_cursor_found);
+    Assert(cursor_found);
+    cursor_pos = mapped_cursor_pos;
     TermOutputBuffer temp = frontbuffer;
     frontbuffer = relayoutbuffer;
     relayoutbuffer = temp;
@@ -363,6 +372,10 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
             if (cursor_pos.Y >= size.Y) {
                 scroll_up(tb, cursor_pos.Y - size.Y + 1);
             }
+            // write space without advancing just to mark this line as "used"
+            TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
+            t->ch = ' ';
+            t->attr = current_attrs;
             str++;
             count--;
         }
@@ -474,6 +487,10 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
             if (cursor_pos.Y >= size.Y) {
                 scroll_up(tb, cursor_pos.Y - size.Y + 1);
             }
+            // write space without advancing just to mark this line as "used"
+            TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
+            t->ch = ' ';
+            t->attr = current_attrs;
             str++;
             count--;
         } else
@@ -662,6 +679,9 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                     } else {
                         FastFast_UpdateTerminalA(frontbuffer, buf, buf_write_idx);
                     }
+                    if (has_cr) {
+                        frontbuffer.line_input_saved_cursor = { 0, 0 };
+                    }
                     FastFast_UnlockTerminal();
                 }
 
@@ -672,7 +692,7 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
             if (!buf_bytes_written) {
                 return STATUS_TIMEOUT;
             }
-            // if we got here, we eitehr got CR or there was some data from previous line read request
+            // if we got here, we either got CR or there was some data from previous line read request
             size_t bytes_left = buf_bytes_written - buf_bytes_read;
             ULONG bytes_to_write = min(bytes_left, user_write_buffer_size);
             write_op.Buffer.Data = buf + buf_bytes_read;
