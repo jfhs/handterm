@@ -567,7 +567,8 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
 
         CD_IO_OPERATION write_op = { 0 };
         write_op.Identifier = ReceiveMsg->Descriptor.Identifier;
-        write_op.Buffer.Offset = ReceiveMsg->msgHeader.ApiDescriptorSize;
+        // no offset with raw requests
+        write_op.Buffer.Offset = ReceiveMsg->Descriptor.Function == CONSOLE_IO_RAW_READ ? 0 : ReceiveMsg->msgHeader.ApiDescriptorSize;
        
         if (!line_mode_enabled) {  
             while (read_ptr != write_ptr) {
@@ -733,7 +734,8 @@ HRESULT HandleWriteMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_compl
     BOOL ok;
 
     PCONSOLE_WRITECONSOLE_MSG write_msg = &ReceiveMsg->u.consoleMsgL1.WriteConsoleW; // this WriteConsole macro...
-    size_t read_offset = ReceiveMsg->msgHeader.ApiDescriptorSize + sizeof(CONSOLE_MSG_HEADER);
+    // no offset with raw requests
+    size_t read_offset = ReceiveMsg->Descriptor.Function == CONSOLE_IO_RAW_WRITE ? 0 : ReceiveMsg->msgHeader.ApiDescriptorSize + sizeof(CONSOLE_MSG_HEADER);
     size_t bytes = ReceiveMsg->Descriptor.InputSize - read_offset;
     if (buf_size < bytes) {
         buf = (char*)realloc(buf, bytes);
