@@ -900,6 +900,11 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
             FastFast_LockTerminal();
             Assert(process_count < sizeof(processes) / sizeof(processes[0]));
             processes[process_count++] = (HANDLE)ReceiveMsg.Descriptor.Process;
+
+            if (data.Title && process_count == 1) {
+                memcpy(console_title, data.Title, min(data.TitleLength + 1, sizeof(console_title)));
+                console_title[sizeof(console_title) / sizeof(console_title[0]) - 1] = 0;
+            }
             FastFast_UnlockTerminal();
 
             if (data.ConsoleApp) {
@@ -1922,7 +1927,7 @@ int WINAPI WinMain(
                 frames = 0;
 
                 WCHAR title[1024];
-                _snwprintf(title, _countof(title), L"Handterm Size=%dx%d RenderFPS=%.2f", frontbuffer.size.X, frontbuffer.size.Y, fps);
+                _snwprintf(title, _countof(title), L"%s Size=%dx%d RenderFPS=%.2f", console_title,frontbuffer.size.X, frontbuffer.size.Y, fps);
                 SetWindowTextW(window, title);
             }
 
