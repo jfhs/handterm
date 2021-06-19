@@ -41,6 +41,9 @@ HANDLE ServerHandle, ReferenceHandle, InputEventHandle;
 #define MIN_WIDTH 32
 #define MIN_HEIGHT 16
 
+#define INPUT_HANDLE 123
+#define OUTPUT_HANDLE 456
+
 ULONG input_console_mode = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_MOUSE_INPUT | ENABLE_INSERT_MODE | ENABLE_EXTENDED_FLAGS | ENABLE_AUTO_POSITION;
 ULONG output_console_mode = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
 
@@ -86,6 +89,9 @@ HANDLE delayed_io_event;
 
 bool show_cursor = true;
 SHORT default_scrollback = 10;
+
+DWORD output_cp = 0;
+DWORD input_cp = 0;
 
 // END GLOBALS
 
@@ -882,8 +888,8 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
 
 
             CD_CONNECTION_INFORMATION connect_info = { 0 };
-            connect_info.Input = 0;
-            connect_info.Output = 1;
+            connect_info.Input = INPUT_HANDLE;
+            connect_info.Output = OUTPUT_HANDLE;
             connect_info.Process = 2;
 
             io_complete.IoStatus.Status = STATUS_SUCCESS;
@@ -911,9 +917,9 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
             PCD_CREATE_OBJECT_INFORMATION const CreateInformation = &ReceiveMsg.CreateObject;
             HANDLE handle = INVALID_HANDLE_VALUE;
             if (CreateInformation->ObjectType == CD_IO_OBJECT_TYPE_CURRENT_INPUT) {
-                handle = 0;
+                handle = (HANDLE)INPUT_HANDLE;
             } else if (CreateInformation->ObjectType == CD_IO_OBJECT_TYPE_CURRENT_OUTPUT) {
-                handle = (HANDLE)1;
+                handle = (HANDLE)OUTPUT_HANDLE;
             } else {
                 // not supported yet
             }
@@ -924,6 +930,9 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
         case CONSOLE_IO_RAW_READ:
         {
             send_io_complete = true;
+            if (ReceiveMsg.Descriptor.Object != INPUT_HANDLE) {
+                break;
+            }
             ZeroMemory(&ReceiveMsg.u.consoleMsgL1.ReadConsoleW, sizeof(CONSOLE_READCONSOLE_MSG));
             ReceiveMsg.msgHeader.ApiNumber = 0x01000005; // ReadConsole
             ReceiveMsg.msgHeader.ApiDescriptorSize = 0;
@@ -940,6 +949,9 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
         case CONSOLE_IO_RAW_WRITE:
         {
             send_io_complete = true;
+            if (ReceiveMsg.Descriptor.Object != OUTPUT_HANDLE) {
+                break;
+            }
             ZeroMemory(&ReceiveMsg.u.consoleMsgL1.WriteConsoleW, sizeof(CONSOLE_WRITECONSOLE_MSG));
             ReceiveMsg.msgHeader.ApiNumber = 0x01000006; // WriteConsole
             ReceiveMsg.msgHeader.ApiDescriptorSize = 0;
@@ -967,10 +979,22 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
             if (LayerNumber == 0) {
                 CONSOLE_L1_API_TYPE l1_type = (CONSOLE_L1_API_TYPE)ApiNumber;
                 switch (l1_type) {
+                case Api_GetConsoleCP: {
+                    PCONSOLE_GETCP_MSG getcp_msg = &ReceiveMsg.u.consoleMsgL1.GetConsoleCP;
+                    FastFast_LockTerminal();
+                    if (getcp_msg->Output) {
+                        getcp_msg->CodePage = output_cp;
+                    } else {
+                        getcp_msg->CodePage = input_cp;
+                    }
+                    FastFast_UnlockTerminal();
+                    io_complete.IoStatus.Status = STATUS_SUCCESS;
+                    break;
+                }
                 case Api_GetConsoleMode: {
                     PCONSOLE_MODE_MSG get_console_msg = &ReceiveMsg.u.consoleMsgL1.GetConsoleMode;
                     // input
-                    if (ReceiveMsg.Descriptor.Object == 0) {
+                    if (ReceiveMsg.Descriptor.Object == INPUT_HANDLE) {
                         get_console_msg->Mode = input_console_mode;
                     } else {
                         get_console_msg->Mode = output_console_mode;
@@ -981,16 +1005,18 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                 case Api_SetConsoleMode: {
                     PCONSOLE_MODE_MSG get_console_msg = &ReceiveMsg.u.consoleMsgL1.GetConsoleMode;
                     // output
-                    if (ReceiveMsg.Descriptor.Object == 0) {
+                    if (ReceiveMsg.Descriptor.Object == INPUT_HANDLE) {
                         input_console_mode = get_console_msg->Mode;
-                    }
-                    else {
+                    } else {
                         output_console_mode = get_console_msg->Mode;
                     }
                     io_complete.IoStatus.Status = STATUS_SUCCESS;
                     break;
                 }
                 case Api_WriteConsole: {
+                    if (ReceiveMsg.Descriptor.Object != OUTPUT_HANDLE) {
+                        break;
+                    }
                     hr = HandleWriteMessage(&ReceiveMsg, &io_complete);
                     /*if (hr == STATUS_TIMEOUT) {
                         send_io_complete = false;
@@ -1002,7 +1028,25 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                     // }
                     break;
                 }
+                case Api_GetNumberOfCOnsoleInputEvents: {
+                    if (ReceiveMsg.Descriptor.Object != INPUT_HANDLE) {
+                        break;
+                    }
+                    PCONSOLE_GETNUMBEROFINPUTEVENTS_MSG get_input_cnt_msg = &ReceiveMsg.u.consoleMsgL1.GetNumberOfConsoleInputEvents;
+                    PINPUT_RECORD write_ptr = pending_events_write_ptr;
+                    PINPUT_RECORD read_ptr = pending_events_read_ptr;
+                    if (read_ptr <= write_ptr) {
+                        get_input_cnt_msg->ReadyEvents = write_ptr - read_ptr;
+                    } else {
+                        get_input_cnt_msg->ReadyEvents = (pending_events_wrap_ptr - read_ptr) + (write_ptr - pending_events);
+                    }
+                    io_complete.IoStatus.Status = STATUS_SUCCESS;
+                    break;
+                }
                 case Api_GetConsoleInput: {
+                    if (ReceiveMsg.Descriptor.Object != INPUT_HANDLE) {
+                        break;
+                    }
                     // write ptr can be modified while we are running, read out value so it doesn't change while we process
                     PINPUT_RECORD write_ptr = pending_events_write_ptr;
                     PINPUT_RECORD read_ptr = pending_events_read_ptr;
@@ -1046,6 +1090,9 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                     break;
                 }
                 case Api_ReadConsole: {
+                    if (ReceiveMsg.Descriptor.Object != INPUT_HANDLE) {
+                        break;
+                    }
                     if (input_console_mode & ENABLE_LINE_INPUT) {
                         FastFast_LockTerminal();
                         frontbuffer.line_input_saved_cursor = frontbuffer.cursor_pos;
@@ -1069,6 +1116,18 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
             else if (LayerNumber == 1) {
                 CONSOLE_L2_API_TYPE l2_type = (CONSOLE_L2_API_TYPE)ApiNumber;
                 switch (l2_type) {
+                case Api_SetConsoleCP: {
+                    PCONSOLE_SETCP_MSG setcp_msg = &ReceiveMsg.u.consoleMsgL2.SetConsoleCP;
+                    FastFast_LockTerminal();
+                    if (setcp_msg->Output) {
+                        output_cp = setcp_msg->CodePage;
+                    } else {
+                        input_cp = setcp_msg->CodePage;
+                    }
+                    FastFast_UnlockTerminal();
+                    io_complete.IoStatus.Status = STATUS_SUCCESS;
+                    break;
+                }
                 case Api_GetConsoleScreenBufferInfo: {
                     PCONSOLE_SCREENBUFFERINFO_MSG buf_info_msg = &ReceiveMsg.u.consoleMsgL2.GetConsoleScreenBufferInfo;
                     buf_info_msg->FullscreenSupported = false;
@@ -1281,6 +1340,9 @@ void SetupConsoleAndProcess()
     _NtOpenFile = (PfnNtOpenFile)GetProcAddress(LoadLibraryExW(L"ntdll.dll", 0, LOAD_LIBRARY_SEARCH_SYSTEM32), "NtOpenFile");
     _ConsoleControl = (PfnConsoleControl)GetProcAddress(LoadLibraryExW(L"user32.dll", 0, LOAD_LIBRARY_SEARCH_SYSTEM32), "ConsoleControl");
     Assert(_NtOpenFile);
+
+    input_cp = GetOEMCP();
+    output_cp = GetOEMCP();
 
     CreateServerHandle(&ServerHandle, FALSE);
     CreateClientHandle(&ReferenceHandle, ServerHandle, L"\\Reference", FALSE);
