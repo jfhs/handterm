@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_DEPRECATE
 #include <windows.h>
+#include <ntstatus.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <math.h>
@@ -87,11 +88,16 @@ CONSOLE_API_MSG delayed_io_msg;
 bool has_delayed_io_msg = false;
 HANDLE delayed_io_event;
 
+bool has_pending_line_read = false;
 bool show_cursor = true;
 SHORT default_scrollback = 10;
 
 DWORD output_cp = 0;
 DWORD input_cp = 0;
+
+// connected ones in stack order
+HANDLE processes[32];
+size_t process_count = 0;
 
 // END GLOBALS
 
@@ -575,7 +581,9 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
         write_op.Identifier = ReceiveMsg->Descriptor.Identifier;
         // no offset with raw requests
         write_op.Buffer.Offset = ReceiveMsg->Descriptor.Function == CONSOLE_IO_RAW_READ ? 0 : ReceiveMsg->msgHeader.ApiDescriptorSize;
-       
+
+        bool abort_input = false;
+
         if (!line_mode_enabled) {  
             while (read_ptr != write_ptr) {
                 // it's expected that in this mode we just skip other events
@@ -618,51 +626,58 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                 bool has_cr = false;
                 while (read_ptr != write_ptr) {
                     // it's expected that in this mode we just skip other events
-                    if (read_ptr->EventType == KEY_EVENT && read_ptr->Event.KeyEvent.uChar.UnicodeChar) {
-                        // todo: support repeat
-                        Assert(read_ptr->Event.KeyEvent.wRepeatCount == 1);
-                        bool is_cr, is_removing;
-                        if (read_msg->Unicode) {
-                            is_cr = read_ptr->Event.KeyEvent.uChar.UnicodeChar == L'\r';
-                            is_removing = read_ptr->Event.KeyEvent.uChar.UnicodeChar == L'\b';
-                        } else {
-                            is_cr = read_ptr->Event.KeyEvent.uChar.AsciiChar == '\r';
-                            is_removing = read_ptr->Event.KeyEvent.uChar.UnicodeChar == '\b';
-                        }
-                        has_cr |= is_cr;
-
-                        if (is_removing) {
-                            // todo: support other chars
-                            if (read_ptr->Event.KeyEvent.uChar.UnicodeChar == L'\b') {
-                                if (buf_write_idx) {
-                                    buf_bytes_written -= read_msg->Unicode ? 2 : 1;
-                                    if (read_msg->Unicode) {
-                                        wbuf[buf_write_idx] = L' ';
-                                    } else {
-                                        buf[buf_write_idx] = ' ';
-                                    }
-                                    --buf_write_idx;
-                                } else {
-                                    // nothing to remove
-                                }
-                            }
-                        }
-                        else {
-                            buf_bytes_written += (is_cr ? 2 : 1) * (read_msg->Unicode ? 2 : 1);
-                            if (buf_bytes_written > buf_size) {
-                                buf_size = buf_size * 2;
-                                buf = (char*)realloc(buf, buf_size);
-                                wbuf = (wchar_t*)buf;
-                            }
+                    if (read_ptr->EventType == KEY_EVENT) {
+                        // CTRL+C handling
+                        if (
+                            (read_ptr->Event.KeyEvent.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) && 
+                            (read_ptr->Event.KeyEvent.wVirtualKeyCode == 'C')
+                        ) {
+                            abort_input = true;
+                        } else if (read_ptr->Event.KeyEvent.uChar.UnicodeChar) {
+                            // todo: support repeat
+                            Assert(read_ptr->Event.KeyEvent.wRepeatCount == 1);
+                            bool is_cr, is_removing;
                             if (read_msg->Unicode) {
-                                wbuf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.UnicodeChar;
-                                if (is_cr) {
-                                    wbuf[buf_write_idx++] = L'\n';
+                                is_cr = read_ptr->Event.KeyEvent.uChar.UnicodeChar == L'\r';
+                                is_removing = read_ptr->Event.KeyEvent.uChar.UnicodeChar == L'\b';
+                            } else {
+                                is_cr = read_ptr->Event.KeyEvent.uChar.AsciiChar == '\r';
+                                is_removing = read_ptr->Event.KeyEvent.uChar.UnicodeChar == '\b';
+                            }
+                            has_cr |= is_cr;
+
+                            if (is_removing) {
+                                // todo: support other chars
+                                if (read_ptr->Event.KeyEvent.uChar.UnicodeChar == L'\b') {
+                                    if (buf_write_idx) {
+                                        buf_bytes_written -= read_msg->Unicode ? 2 : 1;
+                                        if (read_msg->Unicode) {
+                                            wbuf[buf_write_idx] = L' ';
+                                        } else {
+                                            buf[buf_write_idx] = ' ';
+                                        }
+                                        --buf_write_idx;
+                                    } else {
+                                        // nothing to remove
+                                    }
                                 }
                             } else {
-                                buf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.AsciiChar;
-                                if (is_cr) {
-                                    buf[buf_write_idx++] = '\n';
+                                buf_bytes_written += (is_cr ? 2 : 1) * (read_msg->Unicode ? 2 : 1);
+                                if (buf_bytes_written > buf_size) {
+                                    buf_size = buf_size * 2;
+                                    buf = (char*)realloc(buf, buf_size);
+                                    wbuf = (wchar_t*)buf;
+                                }
+                                if (read_msg->Unicode) {
+                                    wbuf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.UnicodeChar;
+                                    if (is_cr) {
+                                        wbuf[buf_write_idx++] = L'\n';
+                                    }
+                                } else {
+                                    buf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.AsciiChar;
+                                    if (is_cr) {
+                                        buf[buf_write_idx++] = '\n';
+                                    }
                                 }
                             }
                         }
@@ -670,7 +685,7 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                     if (++read_ptr == pending_events_wrap_ptr) {
                         read_ptr = pending_events;
                     }
-                    if (line_mode_enabled && has_cr) {
+                    if (line_mode_enabled && has_cr || abort_input) {
                         break;
                     }
                 }
@@ -682,31 +697,38 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                     ResetEvent(InputEventHandle);
                 }
 
-                if (input_console_mode & ENABLE_ECHO_INPUT) {
-                    FastFast_LockTerminal();
-                    // todo: this is not super efficient way to do it, especially for things like backspace at EOL
-                    size_t backup_dist = (frontbuffer.cursor_pos.Y - frontbuffer.line_input_saved_cursor.Y) * frontbuffer.size.X + frontbuffer.cursor_pos.X - frontbuffer.line_input_saved_cursor.X;
-                    for (size_t i = 0; i < backup_dist; ++i) {
-                        char backspace = '\b';
-                        FastFast_UpdateTerminalA(frontbuffer, &backspace, 1);
+                if (abort_input) {
+                    buf_bytes_written = 0;
+                    buf_bytes_read = 0;
+                } else {
+                    if (input_console_mode & ENABLE_ECHO_INPUT) {
+                        FastFast_LockTerminal();
+                        // todo: this is not super efficient way to do it, especially for things like backspace at EOL
+                        size_t backup_dist = (frontbuffer.cursor_pos.Y - frontbuffer.line_input_saved_cursor.Y) * frontbuffer.size.X + frontbuffer.cursor_pos.X - frontbuffer.line_input_saved_cursor.X;
+                        for (size_t i = 0; i < backup_dist; ++i) {
+                            char backspace = '\b';
+                            FastFast_UpdateTerminalA(frontbuffer, &backspace, 1);
+                        }
+                        frontbuffer.cursor_pos = frontbuffer.line_input_saved_cursor;
+                        if (read_msg->Unicode) {
+                            FastFast_UpdateTerminalW(frontbuffer, wbuf, buf_write_idx);
+                        } else {
+                            FastFast_UpdateTerminalA(frontbuffer, buf, buf_write_idx);
+                        }
+                        if (has_cr) {
+                            frontbuffer.line_input_saved_cursor = { 0, 0 };
+                        }
+                        FastFast_UnlockTerminal();
                     }
-                    frontbuffer.cursor_pos = frontbuffer.line_input_saved_cursor;
-                    if (read_msg->Unicode) {
-                        FastFast_UpdateTerminalW(frontbuffer, wbuf, buf_write_idx);
-                    } else {
-                        FastFast_UpdateTerminalA(frontbuffer, buf, buf_write_idx);
-                    }
-                    if (has_cr) {
-                        frontbuffer.line_input_saved_cursor = { 0, 0 };
-                    }
-                    FastFast_UnlockTerminal();
-                }
 
-                if (!has_cr) {
-                    return STATUS_TIMEOUT;
+                    if (!has_cr) {
+                        has_pending_line_read = true;
+                        return STATUS_TIMEOUT;
+                    }
                 }
             }
-            if (!buf_bytes_written) {
+            if (!buf_bytes_written && !abort_input) {
+                has_pending_line_read = true;
                 return STATUS_TIMEOUT;
             }
             // if we got here, we either got CR or there was some data from previous line read request
@@ -723,12 +745,14 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
         buf_bytes_read += write_op.Buffer.Size;
         // reset pointers after whole buffer was written to client
         if (buf_bytes_read == buf_bytes_written) {
+            has_pending_line_read = false;
             buf_bytes_read = 0;
             buf_bytes_written = 0;
             buf_write_idx = 0;
         }
 
         io_complete->IoStatus.Information = read_msg->NumBytes = write_op.Buffer.Size;
+        return abort_input ? STATUS_ALERTED : STATUS_SUCCESS;
     } else {
         return STATUS_TIMEOUT;
     }
@@ -873,6 +897,11 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
             hr = ok ? S_OK : GetLastError();
             Assert(SUCCEEDED(hr));
 
+            FastFast_LockTerminal();
+            Assert(process_count < sizeof(processes) / sizeof(processes[0]));
+            processes[process_count++] = (HANDLE)ReceiveMsg.Descriptor.Process;
+            FastFast_UnlockTerminal();
+
             if (data.ConsoleApp) {
                 CONSOLE_PROCESS_INFO cpi;
                 cpi.dwProcessID = ReceiveMsg.Descriptor.Process;
@@ -890,7 +919,7 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
             CD_CONNECTION_INFORMATION connect_info = { 0 };
             connect_info.Input = INPUT_HANDLE;
             connect_info.Output = OUTPUT_HANDLE;
-            connect_info.Process = 2;
+            connect_info.Process = ReceiveMsg.Descriptor.Process;
 
             io_complete.IoStatus.Status = STATUS_SUCCESS;
             io_complete.IoStatus.Information = sizeof(connect_info);
@@ -904,11 +933,29 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
         }
         case CONSOLE_IO_DISCONNECT: {
             send_io_complete = true;
+            HANDLE pid = (HANDLE)ReceiveMsg.Descriptor.Process;            
+            FastFast_LockTerminal();
+            size_t pid_location = -1;
+            for (size_t i = 0; i < process_count; ++i) {
+                if (processes[i] == pid) {
+                    pid_location = i;
+                    break;
+                }
+            }
+            if (pid_location != -1) {
+                memmove(processes + pid_location, processes + pid_location + 1, (process_count - pid_location - 1) * sizeof(processes[0]));
+                --process_count;
+            } else {
+                Assert(pid_location != -1); // why wouldn't we?
+            }
+            FastFast_UnlockTerminal();
+
             io_complete.IoStatus.Status = STATUS_SUCCESS;
             CONSOLEWINDOWOWNER ConsoleOwner;
-            ConsoleOwner.hwnd = 0;
+            ConsoleOwner.hwnd = window;
             ConsoleOwner.ProcessId = GetCurrentProcessId();
             ConsoleOwner.ThreadId = GetCurrentThreadId();
+
             _ConsoleControl(ConsoleSetWindowOwner, &ConsoleOwner, sizeof(ConsoleOwner));
             break;
         }
@@ -1406,6 +1453,49 @@ void SetupConsoleAndProcess()
     CloseHandle(ClientHandles[2]);
 }
 
+#define KEY_PRESSED 0x8000
+#define KEY_TOGGLED 1
+
+ULONG GetControlKeysState() {
+    ULONG result = 0;
+    if (GetKeyState(VK_LMENU) & KEY_PRESSED) {
+        result |= LEFT_ALT_PRESSED;
+    }
+    if (GetKeyState(VK_RMENU) & KEY_PRESSED) {
+        result |= RIGHT_ALT_PRESSED;
+    }
+    if (GetKeyState(VK_LCONTROL) & KEY_PRESSED) {
+        result |= LEFT_CTRL_PRESSED;
+    }
+    if (GetKeyState(VK_RCONTROL) & KEY_PRESSED) {
+        result |= RIGHT_CTRL_PRESSED;
+    }
+    if (GetKeyState(VK_SHIFT) & KEY_PRESSED) {
+        result |= SHIFT_PRESSED;
+    }
+    if (GetKeyState(VK_NUMLOCK) & KEY_TOGGLED) {
+        result |= NUMLOCK_ON;
+    }
+    if (GetKeyState(VK_SCROLL) & KEY_TOGGLED) {
+        result |= SCROLLLOCK_ON;
+    }
+    if (GetKeyState(VK_CAPITAL) & KEY_TOGGLED) {
+        result |= CAPSLOCK_ON;
+    }
+    return result;
+}
+
+void SendCtrlEventToAllProcesses(DWORD event, ULONG flags) {
+    CONSOLEENDTASK end_task_info;
+    for (size_t i = process_count; i > 0; --i) {
+        end_task_info.ProcessId = processes[i - 1];
+        end_task_info.ConsoleEventCode = event;
+        end_task_info.ConsoleFlags = flags;
+        end_task_info.hwnd = window;
+        _ConsoleControl(ConsoleEndTask, &end_task_info, sizeof(end_task_info));
+    }
+}
+
 DWORD WINAPI WindowThread(LPVOID lpParameter) {
     WNDCLASSEXW wc = { 0 };
     wc.cbSize = sizeof(wc);
@@ -1436,22 +1526,45 @@ DWORD WINAPI WindowThread(LPVOID lpParameter) {
         // OutputDebugStringA("Peekmsg");
         if (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
         {
+            bool translate_dispatch = true;
             if (msg.message == WM_QUIT)
             {
+                console_exit = true;
                 break;
             }
             if (msg.message == WM_KEYDOWN)
             {
+                bool store_event = true;
                 keydown_msg = msg;
-                INPUT_RECORD key_event;
-                key_event.EventType = KEY_EVENT;
-                key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(keydown_msg.wParam);
-                key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
-                key_event.Event.KeyEvent.bKeyDown = true;
-                key_event.Event.KeyEvent.wRepeatCount = LOWORD(msg.lParam);
-                key_event.Event.KeyEvent.uChar.UnicodeChar = 0;
-                PushEvent(key_event);
-                events_added = true;
+                ULONG control_state = GetControlKeysState();
+                WORD vk = LOWORD(msg.wParam);
+                if (control_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) {                    
+                    if (vk == 'C') {
+                        FastFast_LockTerminal();
+                        if (input_console_mode & ENABLE_PROCESSED_INPUT) {
+                            SendCtrlEventToAllProcesses(CTRL_C_EVENT, CONSOLE_CTRL_CLOSE_FLAG);
+                            // EndTask CTRL_C_EVENT
+                            if (!has_pending_line_read) {
+                                store_event = false;
+                            }
+                            translate_dispatch = false;
+                        }
+                        FastFast_UnlockTerminal();
+                    }
+                } 
+
+                if (store_event) {
+                    INPUT_RECORD key_event;
+                    key_event.EventType = KEY_EVENT;
+                    key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(keydown_msg.wParam);
+                    key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
+                    key_event.Event.KeyEvent.bKeyDown = true;
+                    key_event.Event.KeyEvent.wRepeatCount = LOWORD(msg.lParam);
+                    key_event.Event.KeyEvent.uChar.UnicodeChar = 0;
+                    key_event.Event.KeyEvent.dwControlKeyState = control_state;
+                    PushEvent(key_event);
+                    events_added = true;
+                }
             }
             if (msg.message == WM_CHAR)
             {
@@ -1462,13 +1575,16 @@ DWORD WINAPI WindowThread(LPVOID lpParameter) {
                 key_event.Event.KeyEvent.bKeyDown = true;
                 key_event.Event.KeyEvent.wRepeatCount = LOWORD(msg.lParam);
                 key_event.Event.KeyEvent.uChar.UnicodeChar = msg.wParam;
+                key_event.Event.KeyEvent.dwControlKeyState = GetControlKeysState();
                 PushEvent(key_event);
                 events_added = true;
             }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            if (translate_dispatch) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
 
-            char dbg_buf[256];
+            //char dbg_buf[256];
             //sprintf(dbg_buf, "Got message %d", msg.message);
             //OutputDebugStringA(dbg_buf);
             continue;
@@ -1479,6 +1595,11 @@ DWORD WINAPI WindowThread(LPVOID lpParameter) {
         }
         Sleep(10);
     }
+
+    // Cleanup
+    window = 0;
+    SendCtrlEventToAllProcesses(CTRL_CLOSE_EVENT, CONSOLE_CTRL_CLOSE_FLAG);
+
     return 0;
 }
 
