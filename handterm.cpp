@@ -1992,13 +1992,16 @@ int WINAPI WinMain(
                 SetScrollInfo(window, SB_VERT, &si, true);
 
                 FastFast_LockTerminal();
-                TermChar* t = check_wrap(&frontbuffer, frontbuffer.buffer - frontbuffer.size.X * frontbuffer.scrollback);
+                TermChar* t = check_wrap_backwards(&frontbuffer, frontbuffer.buffer - frontbuffer.size.X * frontbuffer.scrollback);
                 TermChar* t_wrap = get_wrap_ptr(&frontbuffer);
                 for (int y = 0; y < frontbuffer.size.Y; y++)
                 {
                     for (int x = 0; x < frontbuffer.size.X; x++)
                     {
                         vtx = AddChar(vtx, (char)t->ch, x, y, t->attr.color, t->attr.backg);
+                        if (t->attr.backg) {
+                            __debugbreak();
+                        }
                         t++;
                     }
                     if (t >= t_wrap) {
