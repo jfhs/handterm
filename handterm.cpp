@@ -18,6 +18,15 @@
 #define Assert(cond) do { if (!(cond)) __debugbreak(); } while (0)
 #define AssertHR(hr) Assert(SUCCEEDED(hr))
 
+static wchar_t dbg_buf[256] = { 0 };
+void debug_printf(const wchar_t* format, ...) {
+    va_list argptr;
+    va_start(argptr, format);
+    vswprintf_s(dbg_buf, 256, format, argptr);
+    va_end(argptr);
+    OutputDebugStringW(dbg_buf);
+}
+
 #pragma comment (lib, "gdi32.lib")
 #pragma comment (lib, "user32.lib")
 #pragma comment (lib, "dxguid.lib")
@@ -49,8 +58,9 @@ ULONG input_console_mode = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_E
 ULONG output_console_mode = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
 
 typedef struct CharAttributes {
-    int color;
+    int color;    
     int backg;
+    bool bold;
     bool soft_wrap;
 };
 
@@ -73,7 +83,8 @@ typedef struct TermOutputBuffer {
 TermOutputBuffer frontbuffer = { 0 };
 TermOutputBuffer relayoutbuffer = { 0 };
 
-CharAttributes current_attrs = { 0xffffff, 0, false };
+static const CharAttributes default_attrs = { 0xffffff, 0, false, false };
+CharAttributes current_attrs = default_attrs;
 
 INPUT_RECORD pending_events[256];
 volatile PINPUT_RECORD pending_events_write_ptr = pending_events;
@@ -163,6 +174,20 @@ void FastFast_LockTerminal() {
 }
 void FastFast_UnlockTerminal() {
     ReleaseMutex(console_mutex);
+}
+
+void scroll_down(TermOutputBuffer& tb, UINT lines) {
+    lines %= tb.size.Y;
+    tb.buffer = check_wrap_backwards(&tb, tb.buffer - tb.size.X * lines);
+    TermChar* zeroing_start = tb.buffer;
+    TermChar* zeroing_end = check_wrap(&tb, zeroing_start + tb.size.X * lines);
+    // if no wrap
+    if (zeroing_end >= zeroing_start) {
+        ZeroMemory(zeroing_start, (char*)zeroing_end - (char*)zeroing_start);
+    } else {
+        ZeroMemory(zeroing_start, (char*)get_wrap_ptr(&tb) - (char*)zeroing_start);
+        ZeroMemory(tb.buffer_start, (char*)zeroing_end - (char*)tb.buffer_start);
+    }
 }
 
 void scroll_up(TermOutputBuffer& tb, UINT lines) {
@@ -287,9 +312,9 @@ void FastFast_Resize(SHORT width, SHORT height) {
     FastFast_UnlockTerminal();
 }
 
-static int num(const wchar_t*& str)
+static int num(const wchar_t*& str, int def = 0)
 {
-    int r = 0;
+    int r = def;
     while (*str >= L'0' && *str <= L'9')
     {
         r *= 10;
@@ -297,9 +322,9 @@ static int num(const wchar_t*& str)
     }
     return r;
 }
-static int num(const char*& str)
+static int num(const char*& str, int def = 0)
 {
-    int r = 0;
+    int r = def;
     while (*str >= '0' && *str <= '9')
     {
         r *= 10;
@@ -308,50 +333,261 @@ static int num(const char*& str)
     return r;
 }
 
+inline bool is_csi_terminal_char_a(char c) {
+    return c >= '\x40' && c <= '\x7e';
+}
+inline bool is_csi_terminal_char_w(wchar_t c) {
+    return c >= L'\x40' && c <= L'\x7e';
+}
+inline bool is_csi_immediate_char_a(char c) {
+    return c >= '\x20' && c <= '\x2f';
+}
+inline bool is_csi_immediate_char_w(wchar_t c) {
+    return c >= L'\x20' && c <= L'\x2f';
+}
+
+// TODO TODO: can this be deduped please?
 void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T count)
 {
     COORD& cursor_pos = tb.cursor_pos;
     COORD& size = tb.size;
+    bool vt_processing_enabled = output_console_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     while (count != 0)
     {
-        if (str[0] == L'\x1b')
+        if (vt_processing_enabled && *str == L'\x1b')
         {
             str++;
             count--;
-            SIZE_T pos = 0;
-            while (pos < count && (str[pos] != 'H' && str[pos] != 'm'))
-            {
-                pos++;
-            }
-            if (pos == count) return;
-            if (str[pos] == 'H')
-            {
-                const wchar_t* s = str + 1;
-                cursor_pos.Y = num(s) - 1;
-                s++;
-                cursor_pos.X = num(s) - 1;
-            }
-            else if (str[pos] == 'm')
-            {
-                BOOL fg = str[1] == L'3';
-                const wchar_t* s = str + 6;
-                int r = num(s);
-                s++;
-                int g = num(s);
-                s++;
-                int b = num(s);
+            Assert(count);
 
-                if (fg) {
-                    current_attrs.color = r | (g << 8) | (b << 16);
-                } else {
-                    current_attrs.backg = r | (g << 8) | (b << 16);
+            if (*str == L'[') {
+                ++str;
+                --count;
+                const wchar_t* param_start = str;
+                const wchar_t* immediate_start = str;
+                const wchar_t* end = nullptr;
+                while (count) {
+                    if (is_csi_terminal_char_w(*str)) {
+                        end = str;
+                        break;
+                    } else if (is_csi_terminal_char_w(*str)) {
+                        immediate_start = str;
+                    }
+                    ++str;
+                    --count;
                 }
+                Assert(end != nullptr); // partial sequences unsupported
+                switch (*end) {
+                case L'H': {
+                    const wchar_t* s = param_start;
+                    cursor_pos.Y = min(tb.size.Y - 1, num(s, 1) - 1);
+                    s++;
+                    cursor_pos.X = min(tb.size.X - 1, num(s, 1) - 1);
+                    break;
+                }
+                case L'J':
+                case L'K': {
+                    const wchar_t* s = param_start;
+                    int erase_mode = num(s);
+                    bool screen = *end == 'J';
+                    COORD start, end;
+                    switch (erase_mode) {
+                    case 0:
+                        start = tb.cursor_pos;
+                        end.X = tb.size.X - 1;
+                        end.Y = screen ? tb.size.Y - 1 : start.Y;
+                        break;
+                    case 1:
+                        start.X = 0;
+                        start.Y = screen ? 0 : start.Y;
+                        end = tb.cursor_pos;
+                        break;
+                    case 2:
+                        start.X = 0;
+                        start.Y = screen ? 0 : start.Y;
+                        end.X = tb.size.X - 1;
+                        end.Y = screen ? tb.size.Y - 1 : start.Y;
+                        break;
+                    default:
+                        debug_printf(L"Unknown erase mode %d", erase_mode);
+                        break;
+                    }
+                    // todo: dedup this ugly wrapping code
+                    TermChar* t = check_wrap(&tb, tb.buffer + tb.size.X * start.Y + start.X);
+                    TermChar* end_t = check_wrap(&tb, tb.buffer + tb.size.X * end.Y + end.X);
+                    if (end_t >= t) {
+                        while (t != end_t) {
+                            t->attr = default_attrs;
+                            t->ch = L' ';
+                            ++t;
+                        }
+                    } else {
+                        TermChar* wrap = get_wrap_ptr(&tb);
+                        while (t != wrap) {
+                            t->attr = default_attrs;
+                            t->ch = L' ';
+                            ++t;
+                        }
+                        t = tb.buffer_start;
+                        while (t != end_t) {
+                            t->attr = default_attrs;
+                            t->ch = L' ';
+                            ++t;
+                        }
+                    }
+                    break;
+                }
+                case L'm': {
+                    const wchar_t* s = param_start;
+                    int rendition = num(s);
+                    s++;
+                    switch (rendition) {
+                    case 0:
+                        current_attrs = default_attrs;
+                        break;
+                    case 1:
+                    case 22:
+                        current_attrs.bold = rendition == 1;
+                        break;
+                    case 7:
+                    case 27: {
+                        // todo: check that 27 without preceding 7 is handled correctly
+                        int temp = current_attrs.color;
+                        current_attrs.color = current_attrs.backg;
+                        current_attrs.backg = temp;
+                        break;
+                    }
+                    // programming languages are great!
+                    case 30:
+                    case 31:
+                    case 32:
+                    case 33:
+                    case 34:
+                    case 35:
+                    case 36:
+                    case 37:
+                    case 40:
+                    case 41:
+                    case 42:
+                    case 43:
+                    case 44:
+                    case 45:
+                    case 46:
+                    case 47: 
+                    case 90:
+                    case 91:
+                    case 92:
+                    case 93:
+                    case 94:
+                    case 95:
+                    case 96:
+                    case 97:
+                    case 100:
+                    case 101:
+                    case 102:
+                    case 103:
+                    case 104:
+                    case 105:
+                    case 106:
+                    case 107: 
+                    {
+                        BOOL fg = rendition < 40 || rendition >= 90 && rendition < 100;
+                        int idx = rendition - (fg ? 30 : 40);
+                        if (idx > 7) {
+                            idx -= 60;
+                        }
+                        int color = default_colors[idx & 0xff];
+                        if (fg) {
+                            current_attrs.color = color;
+                        } else {
+                            current_attrs.backg = color;
+                        }
+                        break;
+                    }
+                    case 38:
+                    case 48: {
+                        BOOL fg = rendition == 38;
+                        int mode = num(s);
+                        s++;
+                        if (mode != 2 && mode != 5) {
+                            debug_printf(L"Unsupported color request type: %d\n", mode);
+                            break;
+                        }
+                        int color;
+                        if (mode == 2) {
+                            int r = num(s);
+                            s++;
+                            int g = num(s);
+                            s++;
+                            int b = num(s);
+                            color = r | (g << 8) | (b << 16);
+                        } else {
+                            int idx = num(s);
+                            if (idx < 16) {
+                                color = default_colors[idx];
+                            } else {
+                                debug_printf(L"Color indicies larger than 15 are not supported\n");
+                                break;
+                            }
+                        }
+
+                        if (fg) {
+                            current_attrs.color = color;
+                        } else {
+                            current_attrs.backg = color;
+                        }
+                        break;
+                    }
+                    default:
+                        debug_printf(L"Unsupported rendition requested: %d\n", rendition);
+                        break;
+                    }
+                    break;
+                }
+                case L'S':
+                case L'T': {
+                    const wchar_t* s = param_start;
+                    int lines = num(s, 1);
+                    s++;
+                    if (*end == 'T') {
+                        scroll_down(tb, lines);
+                    } else {
+                        scroll_up(tb, lines);
+                    }
+                    break;
+                }
+                default: {
+                    debug_printf(L"Unknown VT request %.*s\n", end - param_start + 1, param_start);
+                    break;
+                }
+                }
+                ++str;
+                --count;
+            } else if (*str == L']') {
+                ++str;
+                --count;
+                const wchar_t* param_start = str;
+                const wchar_t* end = nullptr;
+                while (count) {
+                    if (*str == L'\x9c') {
+                        end = str;
+                        break;
+                    }
+                    ++str;
+                    --count;
+                }
+                Assert(end);
+                ++str;
+                --count;
+                debug_printf(L"Unknown OSC request %.*s\n", end - param_start + 1, param_start);
+            } else {
+                ++str;
+                --count;
+                debug_printf(L"Unknown ESC code %d\n", (char)*str);
             }
-            str += pos + 1;
-            count -= pos + 1;
         }
         // backspace
-        else if (str[0] == L'\b') {
+        else if (*str == L'\b') {
             bool overwrite = true;            
             COORD backup_limit = { 0, 0 };
             // todo: this should only be done for echoed input characters, not any backspace that app writes
@@ -383,12 +619,12 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
             str++;
             count--;
         }
-        else if (str[0] == L'\r') {
+        else if (*str == L'\r') {
             cursor_pos.X = 0;
             str++;
             count--;
         }
-        else if (str[0] == L'\n') {
+        else if (*str == L'\n') {
             cursor_pos.X = 0;
             cursor_pos.Y++;
             if (cursor_pos.Y >= size.Y) {
@@ -396,8 +632,10 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
             }
             // write space without advancing just to mark this line as "used"
             TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
-            t->ch = ' ';
-            t->attr = current_attrs;
+            if (!t->ch) {
+                t->ch = L' ';
+                t->attr = current_attrs;
+            }
             str++;
             count--;
         }
@@ -430,42 +668,240 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
 {
     COORD& cursor_pos = tb.cursor_pos;
     COORD& size = tb.size;
+    bool vt_processing_enabled = output_console_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     while (count != 0)
     {
-        if (str[0] == '\x1b')
+        if (vt_processing_enabled && *str == '\x1b')
         {
             str++;
             count--;
-            SIZE_T pos = 0;
-            while (pos < count && (str[pos] != 'H' && str[pos] != 'm'))
-            {
-                pos++;
-            }
-            if (pos == count) return;
-            if (str[pos] == 'H')
-            {
-                const char* s = str + 1;
-                cursor_pos.Y = num(s) - 1;
-                s++;
-                cursor_pos.X = num(s) - 1;
-            } else if (str[pos] == 'm')
-            {
-                BOOL fg = str[1] == L'3';
-                const char* s = str + 6;
-                int r = num(s);
-                s++;
-                int g = num(s);
-                s++;
-                int b = num(s);
+            Assert(count);
 
-                if (fg) {
-                    current_attrs.color = r | (g << 8) | (b << 16);
-                } else {
-                    current_attrs.backg = r | (g << 8) | (b << 16);
+            if (*str == L'[') {
+                ++str;
+                --count;
+                const char* param_start = str;
+                const char* immediate_start = str;
+                const char* end = nullptr;
+                while (count) {
+                    if (is_csi_terminal_char_a(*str)) {
+                        end = str;
+                        break;
+                    } else if (is_csi_terminal_char_a(*str)) {
+                        immediate_start = str;
+                    }
+                    ++str;
+                    --count;
                 }
+                Assert(end != nullptr); // partial sequences unsupported
+                switch (*end) {
+                case L'H': {
+                    const char* s = param_start;
+                    cursor_pos.Y = min(tb.size.Y - 1, num(s, 1) - 1);
+                    s++;
+                    cursor_pos.X = min(tb.size.X - 1, num(s, 1) - 1);
+                    break;
+                }
+                case L'J':
+                case L'K': {
+                    const char* s = param_start;
+                    int erase_mode = num(s);
+                    bool screen = *end == 'J';
+                    COORD start, end;
+                    switch (erase_mode) {
+                    case 0:
+                        start = tb.cursor_pos;
+                        end.X = tb.size.X - 1;
+                        end.Y = screen ? tb.size.Y - 1 : start.Y;
+                        break;
+                    case 1:
+                        start.X = 0;
+                        start.Y = screen ? 0 : start.Y;
+                        end = tb.cursor_pos;
+                        break;
+                    case 2:
+                        start.X = 0;
+                        start.Y = screen ? 0 : start.Y;
+                        end.X = tb.size.X - 1;
+                        end.Y = screen ? tb.size.Y - 1 : start.Y;
+                        break;
+                    default:
+                        debug_printf(L"Unknown erase mode %d", erase_mode);
+                        break;
+                    }
+                    // todo: dedup this ugly wrapping code
+                    TermChar* t = check_wrap(&tb, tb.buffer + tb.size.X * start.Y + start.X);
+                    TermChar* end_t = check_wrap(&tb, tb.buffer + tb.size.X * end.Y + end.X);
+                    if (end_t >= t) {
+                        while (t != end_t) {
+                            t->attr = default_attrs;
+                            t->ch = L' ';
+                            ++t;
+                        }
+                    } else {
+                        TermChar* wrap = get_wrap_ptr(&tb);
+                        while (t != wrap) {
+                            t->attr = default_attrs;
+                            t->ch = L' ';
+                            ++t;
+                        }
+                        t = tb.buffer_start;
+                        while (t != end_t) {
+                            t->attr = default_attrs;
+                            t->ch = L' ';
+                            ++t;
+                        }
+                    }
+                    break;
+                }
+                case L'm': {
+                    const char* s = param_start;
+                    int rendition = num(s);
+                    s++;
+                    switch (rendition) {
+                    case 0:
+                        current_attrs = default_attrs;
+                        break;
+                    case 1:
+                    case 22:
+                        current_attrs.bold = rendition == 1;
+                        break;
+                    case 7:
+                    case 27: {
+                        // todo: check that 27 without preceding 7 is handled correctly
+                        int temp = current_attrs.color;
+                        current_attrs.color = current_attrs.backg;
+                        current_attrs.backg = temp;
+                        break;
+                    }
+                           // programming languages are great!
+                    case 30:
+                    case 31:
+                    case 32:
+                    case 33:
+                    case 34:
+                    case 35:
+                    case 36:
+                    case 37:
+                    case 40:
+                    case 41:
+                    case 42:
+                    case 43:
+                    case 44:
+                    case 45:
+                    case 46:
+                    case 47:
+                    case 90:
+                    case 91:
+                    case 92:
+                    case 93:
+                    case 94:
+                    case 95:
+                    case 96:
+                    case 97:
+                    case 100:
+                    case 101:
+                    case 102:
+                    case 103:
+                    case 104:
+                    case 105:
+                    case 106:
+                    case 107:
+                    {
+                        BOOL fg = rendition < 40 || rendition >= 90 && rendition < 100;
+                        int idx = rendition - (fg ? 30 : 40);
+                        if (idx > 7) {
+                            idx -= 60;
+                        }
+                        int color = default_colors[idx & 0xff];
+                        if (fg) {
+                            current_attrs.color = color;
+                        } else {
+                            current_attrs.backg = color;
+                        }
+                        break;
+                    }
+                    case 38:
+                    case 48: {
+                        BOOL fg = rendition == 38;
+                        int mode = num(s);
+                        s++;
+                        if (mode != 2 && mode != 5) {
+                            debug_printf(L"Unsupported color request type: %d\n", mode);
+                            break;
+                        }
+                        int color;
+                        if (mode == 2) {
+                            int r = num(s);
+                            s++;
+                            int g = num(s);
+                            s++;
+                            int b = num(s);
+                            color = r | (g << 8) | (b << 16);
+                        } else {
+                            int idx = num(s);
+                            if (idx < 16) {
+                                color = default_colors[idx];
+                            } else {
+                                debug_printf(L"Color indicies larger than 15 are not supported\n");
+                                break;
+                            }
+                        }
+
+                        if (fg) {
+                            current_attrs.color = color;
+                        } else {
+                            current_attrs.backg = color;
+                        }
+                        break;
+                    }
+                    default:
+                        debug_printf(L"Unsupported rendition requested: %d\n", rendition);
+                        break;
+                    }
+                    break;
+                }
+                case L'S':
+                case L'T': {
+                    const char* s = param_start;
+                    int lines = num(s, 1);
+                    s++;
+                    if (*end == 'T') {
+                        scroll_down(tb, lines);
+                    } else {
+                        scroll_up(tb, lines);
+                    }
+                    break;
+                }
+                default: {
+                    debug_printf(L"Unknown VT request %.*s\n", end - param_start + 1, param_start);
+                    break;
+                }
+                }
+                ++str;
+                --count;
+            } else if (*str == L']') {
+                ++str;
+                --count;
+                const char* param_start = str;
+                const char* end = nullptr;
+                while (count) {
+                    if (*str == L'\x9c') {
+                        end = str;
+                        break;
+                    }
+                    ++str;
+                    --count;
+                }
+                Assert(end);
+                ++str;
+                --count;
+                debug_printf(L"Unknown OSC request %.*s\n", end - param_start + 1, param_start);
+            } else {
+                ++str;
+                --count;
+                debug_printf(L"Unknown ESC code %d\n", (char)*str);
             }
-            str += pos + 1;
-            count -= pos + 1;
         }
         // backspace
         else if (str[0] == '\b') {
@@ -781,7 +1217,7 @@ HRESULT HandleWriteMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_compl
     Assert(SUCCEEDED(hr));
 
     FastFast_LockTerminal();
-    if (write_msg->Unicode) {
+   if (write_msg->Unicode) {
         FastFast_UpdateTerminalW(frontbuffer, (wchar_t*)buf, bytes / 2);
     } else {
         FastFast_UpdateTerminalA(frontbuffer, buf, bytes);
@@ -858,9 +1294,7 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
     PCONSOLE_API_MSG ReplyMsg = 0;
     bool send_io_complete = false;
     CD_IO_COMPLETE io_complete = { 0 };
-    ULONG ReadOffset = 0;    
-
-    char dbg_buf[256] = { 0 };
+    ULONG ReadOffset = 0;
 
     while (!console_exit) {
         // Read next command
@@ -1161,8 +1595,7 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                     break;
                 }
                 default:
-                    sprintf(dbg_buf, "Unhandled L1 request %d\n", ApiNumber);
-                    OutputDebugStringA(dbg_buf);
+                    debug_printf(L"Unhandled L1 request %d\n", ApiNumber);
                 }
             }
             else if (LayerNumber == 1) {
@@ -1253,16 +1686,14 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                     current_attrs.color = fg_idx ? default_colors[fg_idx] : default_fg_color;
 
                     if (set_attr_msg->Attributes & META_ATTRS) {
-                        sprintf(dbg_buf, "Unhandled console attributes in reqeust %d\n", set_attr_msg->Attributes);
-                        OutputDebugStringA(dbg_buf);
+                        debug_printf(L"Unhandled console attributes in reqeust %d\n", set_attr_msg->Attributes);
                     }
 
                     io_complete.IoStatus.Status = STATUS_SUCCESS;
                     break;
                 }
                 default:
-                    sprintf(dbg_buf, "Unhandled L2 request %d\n", ApiNumber);
-                    OutputDebugStringA(dbg_buf);
+                    debug_printf(L"Unhandled L2 request %d\n", ApiNumber);
                 }
             } else if (LayerNumber == 2) {
                 CONSOLE_L3_API_TYPE l3_type = (CONSOLE_L3_API_TYPE)ApiNumber;
@@ -1274,21 +1705,18 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                     break;
                 }
                 default:
-                    sprintf(dbg_buf, "Unhandled L3 request %d\n", ApiNumber);
-                    OutputDebugStringA(dbg_buf);
+                    debug_printf(L"Unhandled L3 request %d\n", ApiNumber);
                     break;
                 }
             } else {
-                sprintf(dbg_buf, "Unhandled unknown layer %d request %d\n", LayerNumber, ApiNumber);
-                OutputDebugStringA(dbg_buf);
+                debug_printf(L"Unhandled unknown layer %d request %d\n", LayerNumber, ApiNumber);
             }
             break;
         }
         default:
             send_io_complete = true;
             io_complete.IoStatus.Status = STATUS_UNSUCCESSFUL;
-            sprintf(dbg_buf, "Unhandled request %d\n", ReceiveMsg.Descriptor.Function);
-            OutputDebugStringA(dbg_buf);
+            debug_printf(L"Unhandled request %d\n", ReceiveMsg.Descriptor.Function);
             break;
         }
     }
@@ -1330,10 +1758,7 @@ static LRESULT CALLBACK WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lPa
             }
             case SB_THUMBTRACK: {
                 frontbuffer.scrollback = max(0, min(frontbuffer.scrollback_available, frontbuffer.scrollback_available - HIWORD(wParam)));
-                char dbg_buf[256] = { 0 };
-                sprintf(dbg_buf, "Thumbtrack event, wparam.hi=%d scrollback=%d\n", HIWORD(wParam), frontbuffer.scrollback);
-                OutputDebugStringA(dbg_buf);
-
+                debug_printf(L"Thumbtrack event, wparam.hi=%d scrollback=%d\n", HIWORD(wParam), frontbuffer.scrollback);
                 break;
             }
             }
@@ -1589,9 +2014,7 @@ DWORD WINAPI WindowThread(LPVOID lpParameter) {
                 DispatchMessageW(&msg);
             }
 
-            //char dbg_buf[256];
-            //sprintf(dbg_buf, "Got message %d", msg.message);
-            //OutputDebugStringA(dbg_buf);
+            //debug_printf(L"Got message %d", msg.message);
             continue;
         }
         if (events_added) {
@@ -1999,9 +2422,6 @@ int WINAPI WinMain(
                     for (int x = 0; x < frontbuffer.size.X; x++)
                     {
                         vtx = AddChar(vtx, (char)t->ch, x, y, t->attr.color, t->attr.backg);
-                        if (t->attr.backg) {
-                            __debugbreak();
-                        }
                         t++;
                     }
                     if (t >= t_wrap) {
