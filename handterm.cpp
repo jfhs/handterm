@@ -26,12 +26,20 @@ void debug_printf(const wchar_t* format, ...) {
     va_end(argptr);
     OutputDebugStringW(dbg_buf);
 }
+void debug_printf_a(const char* format, ...) {
+    va_list argptr;
+    va_start(argptr, format);
+    vsprintf_s((char*)dbg_buf, 256, format, argptr);
+    va_end(argptr);
+    OutputDebugStringA((char*)dbg_buf);
+}
 
 #pragma comment (lib, "gdi32.lib")
 #pragma comment (lib, "user32.lib")
 #pragma comment (lib, "dxguid.lib")
 #pragma comment (lib, "d3d11.lib")
 #pragma comment (lib, "d3dcompiler.lib")
+#pragma comment (lib, "Winmm.lib")
 
 #define STR2(x) #x
 #define STR(x) STR2(x)
@@ -569,7 +577,7 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
                 const wchar_t* param_start = str;
                 const wchar_t* end = nullptr;
                 while (count) {
-                    if (*str == L'\x9c') {
+                    if (*str == L'\x9c' || *str == L'\a') {
                         end = str;
                         break;
                     }
@@ -638,8 +646,12 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
             }
             str++;
             count--;
-        }
-        else
+        } else if (*str == L'\a') {
+            // bell
+            str++;
+            count--;
+            PlaySoundW((LPCWSTR)SND_ALIAS_SYSTEMHAND, nullptr, SND_ALIAS_ID | SND_ASYNC | SND_SENTRY);
+        } else
         {
             // todo: also do that if cursor moves beyond and WRAP_AT_EOL_OUTPUT is enabled
             if (cursor_pos.Y >= size.Y) {
@@ -677,7 +689,7 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
             count--;
             Assert(count);
 
-            if (*str == L'[') {
+            if (*str == '[') {
                 ++str;
                 --count;
                 const char* param_start = str;
@@ -695,15 +707,15 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
                 }
                 Assert(end != nullptr); // partial sequences unsupported
                 switch (*end) {
-                case L'H': {
+                case 'H': {
                     const char* s = param_start;
                     cursor_pos.Y = min(tb.size.Y - 1, num(s, 1) - 1);
                     s++;
                     cursor_pos.X = min(tb.size.X - 1, num(s, 1) - 1);
                     break;
                 }
-                case L'J':
-                case L'K': {
+                case 'J':
+                case 'K': {
                     const char* s = param_start;
                     int erase_mode = num(s);
                     bool screen = *end == 'J';
@@ -754,7 +766,7 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
                     }
                     break;
                 }
-                case L'm': {
+                case 'm': {
                     const char* s = param_start;
                     int rendition = num(s);
                     s++;
@@ -861,8 +873,8 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
                     }
                     break;
                 }
-                case L'S':
-                case L'T': {
+                case 'S':
+                case 'T': {
                     const char* s = param_start;
                     int lines = num(s, 1);
                     s++;
@@ -874,19 +886,19 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
                     break;
                 }
                 default: {
-                    debug_printf(L"Unknown VT request %.*s\n", end - param_start + 1, param_start);
+                    debug_printf_a("Unknown VT request %.*s\n", end - param_start + 1, param_start);
                     break;
                 }
                 }
                 ++str;
                 --count;
-            } else if (*str == L']') {
+            } else if (*str == ']') {
                 ++str;
                 --count;
                 const char* param_start = str;
                 const char* end = nullptr;
                 while (count) {
-                    if (*str == L'\x9c') {
+                    if (*str == '\x9c' || *str == '\a') {
                         end = str;
                         break;
                     }
@@ -896,15 +908,15 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
                 Assert(end);
                 ++str;
                 --count;
-                debug_printf(L"Unknown OSC request %.*s\n", end - param_start + 1, param_start);
+                debug_printf_a("Unknown OSC request %.*s\n", end - param_start + 1, param_start);
             } else {
                 ++str;
                 --count;
-                debug_printf(L"Unknown ESC code %d\n", (char)*str);
+                debug_printf_a("Unknown ESC code %d\n", (char)*str);
             }
         }
         // backspace
-        else if (str[0] == '\b') {
+        else if (*str == '\b') {
             bool overwrite = true;
             COORD backup_limit = { 0, 0 };
             // todo: this should only be done for echoed input characters, not any backspace that app writes
@@ -935,11 +947,11 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
             }
             str++;
             count--;
-        } else if (str[0] == '\r') {
+        } else if (*str == '\r') {
             cursor_pos.X = 0;
             str++;
             count--;
-        } else if (str[0] == '\n') {
+        } else if (*str == '\n') {
             cursor_pos.X = 0;
             cursor_pos.Y++;
             if (cursor_pos.Y >= size.Y) {
@@ -951,6 +963,11 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
             t->attr = current_attrs;
             str++;
             count--;
+        } else if (*str == '\a') {
+            // bell
+            str++;
+            count--;
+            PlaySoundW((LPCWSTR)SND_ALIAS_SYSTEMHAND, nullptr, SND_ALIAS_ID | SND_ASYNC | SND_SENTRY);
         } else
         {
             // todo: also do that if cursor moves beyond and WRAP_AT_EOL_OUTPUT is enabled
@@ -1194,6 +1211,73 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
     }
 }
 
+HRESULT HandleGetInputMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_complete) {
+    DWORD BytesRead = 0;
+    HRESULT hr;
+    BOOL ok;
+
+    PCONSOLE_GETCONSOLEINPUT_MSG input_msg = &ReceiveMsg->u.consoleMsgL1.GetConsoleInput;
+    // write ptr can be modified while we are running, read out value so it doesn't change while we process
+    PINPUT_RECORD write_ptr = pending_events_write_ptr;
+    PINPUT_RECORD read_ptr = pending_events_read_ptr;
+    if (read_ptr != write_ptr) {
+        // wrapped, just read till the end, next read operation can read chunk at the beginning
+        if (write_ptr < read_ptr) {
+            write_ptr = pending_events_wrap_ptr;
+        }
+
+        input_msg->NumRecords = min(ReceiveMsg->Descriptor.OutputSize / sizeof(INPUT_RECORD), write_ptr - read_ptr);
+
+        size_t bytes = sizeof(INPUT_RECORD) * input_msg->NumRecords;
+
+        CD_IO_OPERATION write_op = { 0 };
+        write_op.Identifier = ReceiveMsg->Descriptor.Identifier;
+        write_op.Buffer.Offset = ReceiveMsg->msgHeader.ApiDescriptorSize;
+        write_op.Buffer.Data = read_ptr;
+        write_op.Buffer.Size = bytes;
+
+        ok = DeviceIoControl(ServerHandle, IOCTL_CONDRV_WRITE_OUTPUT, &write_op, sizeof(write_op), 0, 0, &BytesRead, 0);
+        hr = ok ? S_OK : GetLastError();
+        Assert(SUCCEEDED(hr));
+
+        read_ptr += input_msg->NumRecords;
+        if (read_ptr == pending_events_wrap_ptr) {
+            read_ptr = pending_events;
+        }
+
+        if (!(input_msg->Flags & CONSOLE_READ_NOREMOVE)) {
+            pending_events_read_ptr = read_ptr;
+            // todo: this is most likely not thread safe
+            if (pending_events_read_ptr == pending_events_write_ptr) {
+                ResetEvent(InputEventHandle);
+            }
+        }
+
+        io_complete->IoStatus.Information = bytes;
+        return STATUS_SUCCESS;
+    } else {
+        if (!(input_msg->Flags & CONSOLE_READ_NOWAIT)) {
+            return STATUS_TIMEOUT;
+        } else {
+            // client doesn't want to wait
+            // we still have to do zero write...
+            CD_IO_OPERATION write_op = { 0 };
+            write_op.Identifier = ReceiveMsg->Descriptor.Identifier;
+            write_op.Buffer.Offset = ReceiveMsg->msgHeader.ApiDescriptorSize;
+            write_op.Buffer.Data = read_ptr;
+            write_op.Buffer.Size = 0;
+
+            ok = DeviceIoControl(ServerHandle, IOCTL_CONDRV_WRITE_OUTPUT, &write_op, sizeof(write_op), 0, 0, &BytesRead, 0);
+            hr = ok ? S_OK : GetLastError();
+            Assert(SUCCEEDED(hr));
+
+            input_msg->NumRecords = 0;
+            io_complete->IoStatus.Information = 0;
+            return STATUS_SUCCESS;
+        }
+    }
+}
+
 HRESULT HandleWriteMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_complete) {
     DWORD BytesRead = 0;
     HRESULT hr;
@@ -1256,6 +1340,20 @@ DWORD WINAPI DelayedIoThread(LPVOID lpParameter)
                 case Api_ReadConsole: {
                     io_complete.IoStatus.Status = HandleReadMessage(&delayed_io_msg, &io_complete);
                     // no data available, leave all as is
+                    if (io_complete.IoStatus.Status == STATUS_TIMEOUT) {
+                        break;
+                    }
+                    ok = DeviceIoControl(ServerHandle, IOCTL_CONDRV_COMPLETE_IO, &io_complete, sizeof(io_complete), 0, 0, &BytesRead, 0);
+                    hr = ok ? S_OK : GetLastError();
+                    Assert(SUCCEEDED(hr));
+                    has_delayed_io_msg = false;
+                    // not really required, but useful for debugging
+                    ZeroMemory(&delayed_io_msg, sizeof(delayed_io_msg));
+                    break;
+                }
+                case Api_GetConsoleInput: {
+                    io_complete.IoStatus.Status = HandleReadMessage(&delayed_io_msg, &io_complete);
+                    // shouldn't really happen
                     if (io_complete.IoStatus.Status == STATUS_TIMEOUT) {
                         break;
                     }
@@ -1533,45 +1631,13 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                     if (ReceiveMsg.Descriptor.Object != INPUT_HANDLE) {
                         break;
                     }
-                    // write ptr can be modified while we are running, read out value so it doesn't change while we process
-                    PINPUT_RECORD write_ptr = pending_events_write_ptr;
-                    PINPUT_RECORD read_ptr = pending_events_read_ptr;
-                    if (read_ptr != write_ptr) {
-                        PCONSOLE_GETCONSOLEINPUT_MSG input_msg = &ReceiveMsg.u.consoleMsgL1.GetConsoleInput;
-
-                        // wrapped, just read till the end, next read operation can read chunk at the beginning
-                        if (write_ptr < read_ptr) {
-                            write_ptr = pending_events_wrap_ptr;
-                        }
-
-                        input_msg->NumRecords = write_ptr - read_ptr;
-
-                        size_t bytes = sizeof(INPUT_RECORD) * input_msg->NumRecords;
-
-                        CD_IO_OPERATION write_op = { 0 };
-                        write_op.Identifier = ReceiveMsg.Descriptor.Identifier;
-                        write_op.Buffer.Offset = ReceiveMsg.msgHeader.ApiDescriptorSize;
-                        write_op.Buffer.Data = read_ptr;
-                        write_op.Buffer.Size = bytes;
-
-                        ok = DeviceIoControl(ServerHandle, IOCTL_CONDRV_WRITE_OUTPUT, &write_op, sizeof(write_op), 0, 0, &BytesRead, 0);
-                        hr = ok ? S_OK : GetLastError();
-                        Assert(SUCCEEDED(hr));
-
-                        read_ptr = write_ptr;
-                        if (read_ptr == pending_events_wrap_ptr) {
-                            read_ptr = pending_events;
-                        }
-                        pending_events_read_ptr = read_ptr;
-                        // todo: this is most likely not thread safe
-                        if (pending_events_read_ptr == pending_events_write_ptr) {
-                            ResetEvent(InputEventHandle);
-                        }
-
-                        io_complete.IoStatus.Status = STATUS_SUCCESS;
-                        io_complete.IoStatus.Information = bytes;
+                    hr = HandleGetInputMessage(&ReceiveMsg, &io_complete);
+                    if (hr == STATUS_TIMEOUT) {
+                        send_io_complete = false;
+                        delayed_io_msg = ReceiveMsg;
+                        has_delayed_io_msg = true;
                     } else {
-                        // should delay reply
+                        io_complete.IoStatus.Status = hr;
                     }
                     break;
                 }
@@ -1962,10 +2028,12 @@ DWORD WINAPI WindowThread(LPVOID lpParameter) {
                 console_exit = true;
                 break;
             }
-            if (msg.message == WM_KEYDOWN)
+            if (msg.message == WM_KEYDOWN || msg.message == WM_KEYUP)
             {
                 bool store_event = true;
-                keydown_msg = msg;
+                if (msg.message == WM_KEYDOWN) {
+                    keydown_msg = msg;
+                }
                 ULONG control_state = GetControlKeysState();
                 WORD vk = LOWORD(msg.wParam);
                 if (control_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) {                    
@@ -1986,9 +2054,9 @@ DWORD WINAPI WindowThread(LPVOID lpParameter) {
                 if (store_event) {
                     INPUT_RECORD key_event;
                     key_event.EventType = KEY_EVENT;
-                    key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(keydown_msg.wParam);
-                    key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
-                    key_event.Event.KeyEvent.bKeyDown = true;
+                    key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(msg.wParam);
+                    key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(msg.lParam));
+                    key_event.Event.KeyEvent.bKeyDown = msg.message == WM_KEYDOWN;
                     key_event.Event.KeyEvent.wRepeatCount = LOWORD(msg.lParam);
                     key_event.Event.KeyEvent.uChar.UnicodeChar = 0;
                     key_event.Event.KeyEvent.dwControlKeyState = control_state;
