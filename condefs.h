@@ -53,6 +53,7 @@ typedef enum ControlType
 
 typedef NTSTATUS(NTAPI* PfnNtOpenFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
 typedef NTSTATUS(WINAPI* PfnConsoleControl)(ControlType Command, PVOID Information, DWORD Length);
+typedef BOOL(WINAPI* PfnTranslateMessageEx)(const MSG* pmsg, UINT flags);
 
 extern PfnNtOpenFile _NtOpenFile;
 extern PfnConsoleControl _ConsoleControl;
@@ -144,3 +145,6 @@ typedef struct _CONSOLEENDTASK
 
 #define CONSOLE_READ_NOREMOVE   0x0001
 #define CONSOLE_READ_NOWAIT     0x0002
+
+// Used by TranslateMessageEx to purposefully return false to certain WM_KEYDOWN/WM_CHAR messages
+#define TM_POSTCHARBREAKS 0x0002

@@ -46,6 +46,7 @@ void debug_printf_a(const char* format, ...) {
 
 PfnNtOpenFile _NtOpenFile;
 PfnConsoleControl _ConsoleControl;
+PfnTranslateMessageEx _TranslateMessageEx;
 
 // GLOBALS
 HWND window;
@@ -1040,7 +1041,7 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
         if (!line_mode_enabled) {  
             while (read_ptr != write_ptr) {
                 // it's expected that in this mode we just skip other events
-                if (read_ptr->EventType == KEY_EVENT && read_ptr->Event.KeyEvent.uChar.UnicodeChar) {
+                if (read_ptr->EventType == KEY_EVENT && read_ptr->Event.KeyEvent.uChar.UnicodeChar && read_ptr->Event.KeyEvent.bKeyDown) {
                     // todo: support repeat
                     Assert(read_ptr->Event.KeyEvent.wRepeatCount == 1);
 
@@ -1086,7 +1087,7 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                             (read_ptr->Event.KeyEvent.wVirtualKeyCode == 'C')
                         ) {
                             abort_input = true;
-                        } else if (read_ptr->Event.KeyEvent.uChar.UnicodeChar) {
+                        } else if (read_ptr->Event.KeyEvent.uChar.UnicodeChar && read_ptr->Event.KeyEvent.bKeyDown) {
                             // todo: support repeat
                             Assert(read_ptr->Event.KeyEvent.wRepeatCount == 1);
                             bool is_cr, is_removing;
@@ -1789,6 +1790,51 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
     return 0;
 }
 
+MSG keydown_msg;
+
+#define KEY_PRESSED 0x8000
+#define KEY_TOGGLED 1
+
+ULONG GetControlKeysState() {
+    ULONG result = 0;
+    if (GetKeyState(VK_LMENU) & KEY_PRESSED) {
+        result |= LEFT_ALT_PRESSED;
+    }
+    if (GetKeyState(VK_RMENU) & KEY_PRESSED) {
+        result |= RIGHT_ALT_PRESSED;
+    }
+    if (GetKeyState(VK_LCONTROL) & KEY_PRESSED) {
+        result |= LEFT_CTRL_PRESSED;
+    }
+    if (GetKeyState(VK_RCONTROL) & KEY_PRESSED) {
+        result |= RIGHT_CTRL_PRESSED;
+    }
+    if (GetKeyState(VK_SHIFT) & KEY_PRESSED) {
+        result |= SHIFT_PRESSED;
+    }
+    if (GetKeyState(VK_NUMLOCK) & KEY_TOGGLED) {
+        result |= NUMLOCK_ON;
+    }
+    if (GetKeyState(VK_SCROLL) & KEY_TOGGLED) {
+        result |= SCROLLLOCK_ON;
+    }
+    if (GetKeyState(VK_CAPITAL) & KEY_TOGGLED) {
+        result |= CAPSLOCK_ON;
+    }
+    return result;
+}
+
+void SendCtrlEventToAllProcesses(DWORD event, ULONG flags) {
+    CONSOLEENDTASK end_task_info;
+    for (size_t i = process_count; i > 0; --i) {
+        end_task_info.ProcessId = processes[i - 1];
+        end_task_info.ConsoleEventCode = event;
+        end_task_info.ConsoleFlags = flags;
+        end_task_info.hwnd = window;
+        _ConsoleControl(ConsoleEndTask, &end_task_info, sizeof(end_task_info));
+    }
+}
+
 static LRESULT CALLBACK WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
@@ -1829,6 +1875,54 @@ static LRESULT CALLBACK WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lPa
             }
             }
             FastFast_UnlockTerminal();
+            return 0;
+        }
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+        {
+            bool store_event = true;
+            ULONG control_state = GetControlKeysState();
+            WORD vk = LOWORD(wParam);
+            if (control_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) {
+                if (vk == 'C') {
+                    FastFast_LockTerminal();
+                    if (input_console_mode & ENABLE_PROCESSED_INPUT) {
+                        SendCtrlEventToAllProcesses(CTRL_C_EVENT, CONSOLE_CTRL_CLOSE_FLAG);
+                        // EndTask CTRL_C_EVENT
+                        if (!has_pending_line_read) {
+                            store_event = false;
+                        }
+                    }
+                    FastFast_UnlockTerminal();
+                }
+            }
+
+            if (store_event) {
+                INPUT_RECORD key_event;
+                key_event.EventType = KEY_EVENT;
+                key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(wParam);
+                key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(lParam));
+                key_event.Event.KeyEvent.bKeyDown = msg == WM_KEYDOWN;
+                key_event.Event.KeyEvent.wRepeatCount = LOWORD(lParam);
+                key_event.Event.KeyEvent.uChar.UnicodeChar = 0;
+                key_event.Event.KeyEvent.dwControlKeyState = control_state;
+                PushEvent(key_event);
+                SetEvent(delayed_io_event);
+            }
+            return 0;
+        }
+    case WM_CHAR:
+        {
+            INPUT_RECORD key_event;
+            key_event.EventType = KEY_EVENT;
+            key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(keydown_msg.wParam);
+            key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
+            key_event.Event.KeyEvent.bKeyDown = !((lParam >> 31) & 1); // if bit 31 is set, char is being released
+            key_event.Event.KeyEvent.wRepeatCount = LOWORD(lParam);
+            key_event.Event.KeyEvent.uChar.UnicodeChar = wParam;
+            key_event.Event.KeyEvent.dwControlKeyState = GetControlKeysState();
+            PushEvent(key_event);
+            SetEvent(delayed_io_event);
             return 0;
         }
     }
@@ -1949,50 +2043,9 @@ void SetupConsoleAndProcess()
     CloseHandle(ClientHandles[2]);
 }
 
-#define KEY_PRESSED 0x8000
-#define KEY_TOGGLED 1
-
-ULONG GetControlKeysState() {
-    ULONG result = 0;
-    if (GetKeyState(VK_LMENU) & KEY_PRESSED) {
-        result |= LEFT_ALT_PRESSED;
-    }
-    if (GetKeyState(VK_RMENU) & KEY_PRESSED) {
-        result |= RIGHT_ALT_PRESSED;
-    }
-    if (GetKeyState(VK_LCONTROL) & KEY_PRESSED) {
-        result |= LEFT_CTRL_PRESSED;
-    }
-    if (GetKeyState(VK_RCONTROL) & KEY_PRESSED) {
-        result |= RIGHT_CTRL_PRESSED;
-    }
-    if (GetKeyState(VK_SHIFT) & KEY_PRESSED) {
-        result |= SHIFT_PRESSED;
-    }
-    if (GetKeyState(VK_NUMLOCK) & KEY_TOGGLED) {
-        result |= NUMLOCK_ON;
-    }
-    if (GetKeyState(VK_SCROLL) & KEY_TOGGLED) {
-        result |= SCROLLLOCK_ON;
-    }
-    if (GetKeyState(VK_CAPITAL) & KEY_TOGGLED) {
-        result |= CAPSLOCK_ON;
-    }
-    return result;
-}
-
-void SendCtrlEventToAllProcesses(DWORD event, ULONG flags) {
-    CONSOLEENDTASK end_task_info;
-    for (size_t i = process_count; i > 0; --i) {
-        end_task_info.ProcessId = processes[i - 1];
-        end_task_info.ConsoleEventCode = event;
-        end_task_info.ConsoleFlags = flags;
-        end_task_info.hwnd = window;
-        _ConsoleControl(ConsoleEndTask, &end_task_info, sizeof(end_task_info));
-    }
-}
-
 DWORD WINAPI WindowThread(LPVOID lpParameter) {
+    _TranslateMessageEx = (PfnTranslateMessageEx)GetProcAddress(LoadLibraryExW(L"user32.dll", 0, LOAD_LIBRARY_SEARCH_SYSTEM32), "TranslateMessageEx");
+
     WNDCLASSEXW wc = { 0 };
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WindowProc;
@@ -2015,81 +2068,18 @@ DWORD WINAPI WindowThread(LPVOID lpParameter) {
 
     SetEvent(window_ready_event);
 
-    bool events_added = false;
-    MSG keydown_msg;
     while (!console_exit) {
         MSG msg;
-        // OutputDebugStringA("Peekmsg");
-        if (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+        if (!GetMessageW(&msg, nullptr, 0, 0))
         {
-            bool translate_dispatch = true;
-            if (msg.message == WM_QUIT)
-            {
-                console_exit = true;
-                break;
-            }
-            if (msg.message == WM_KEYDOWN || msg.message == WM_KEYUP)
-            {
-                bool store_event = true;
-                if (msg.message == WM_KEYDOWN) {
-                    keydown_msg = msg;
-                }
-                ULONG control_state = GetControlKeysState();
-                WORD vk = LOWORD(msg.wParam);
-                if (control_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) {                    
-                    if (vk == 'C') {
-                        FastFast_LockTerminal();
-                        if (input_console_mode & ENABLE_PROCESSED_INPUT) {
-                            SendCtrlEventToAllProcesses(CTRL_C_EVENT, CONSOLE_CTRL_CLOSE_FLAG);
-                            // EndTask CTRL_C_EVENT
-                            if (!has_pending_line_read) {
-                                store_event = false;
-                            }
-                            translate_dispatch = false;
-                        }
-                        FastFast_UnlockTerminal();
-                    }
-                } 
-
-                if (store_event) {
-                    INPUT_RECORD key_event;
-                    key_event.EventType = KEY_EVENT;
-                    key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(msg.wParam);
-                    key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(msg.lParam));
-                    key_event.Event.KeyEvent.bKeyDown = msg.message == WM_KEYDOWN;
-                    key_event.Event.KeyEvent.wRepeatCount = LOWORD(msg.lParam);
-                    key_event.Event.KeyEvent.uChar.UnicodeChar = 0;
-                    key_event.Event.KeyEvent.dwControlKeyState = control_state;
-                    PushEvent(key_event);
-                    events_added = true;
-                }
-            }
-            if (msg.message == WM_CHAR)
-            {
-                INPUT_RECORD key_event;
-                key_event.EventType = KEY_EVENT;
-                key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(keydown_msg.wParam);
-                key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
-                key_event.Event.KeyEvent.bKeyDown = true;
-                key_event.Event.KeyEvent.wRepeatCount = LOWORD(msg.lParam);
-                key_event.Event.KeyEvent.uChar.UnicodeChar = msg.wParam;
-                key_event.Event.KeyEvent.dwControlKeyState = GetControlKeysState();
-                PushEvent(key_event);
-                events_added = true;
-            }
-            if (translate_dispatch) {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-
-            //debug_printf(L"Got message %d", msg.message);
-            continue;
+            console_exit = true;
+            break;
+        }        
+        if (!_TranslateMessageEx(&msg, TM_POSTCHARBREAKS)) {
+            DispatchMessageW(&msg);
+        } else {
+            keydown_msg = msg;
         }
-        if (events_added) {
-            events_added = false;
-            SetEvent(delayed_io_event);
-        }
-        Sleep(10);
     }
 
     // Cleanup
