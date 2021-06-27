@@ -339,7 +339,7 @@ static int num(const wchar_t*& str, int def = 0)
         r += *str++ - '0';
         ++it;
     }
-    return it ? r : def;
+    return (it && r) ? r : def;
 }
 static int num(const char*& str, int def = 0)
 {
@@ -351,7 +351,7 @@ static int num(const char*& str, int def = 0)
         r += *str++ - '0';
         ++it;
     }
-    return it ? r : def;
+    return (it && r) ? r : def;
 }
 
 inline bool is_csi_terminal_char_a(char c) {
@@ -399,7 +399,52 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
                 }
                 Assert(end != nullptr); // partial sequences unsupported
                 switch (*end) {
-                case L'H': {
+                case L'A':
+                case L'F': {
+                    const wchar_t* s = param_start;
+                    int lines = num(s, 1);
+                    cursor_pos.Y -= min(cursor_pos.Y, lines);
+                    if (*end == 'F') {
+                        cursor_pos.X = 0;
+                    }
+                    break;
+                }
+                case L'B':
+                case L'E': {
+                    const wchar_t* s = param_start;
+                    int lines = num(s, 1);
+                    cursor_pos.Y = min(tb.size.Y - 1, cursor_pos.Y + lines);
+                    if (*end == 'E') {
+                        cursor_pos.X = 0;
+                    }
+                    break;
+                }
+                case L'C': {
+                    const wchar_t* s = param_start;
+                    int chars = num(s, 1);
+                    cursor_pos.X = min(tb.size.X - 1, cursor_pos.X + chars);
+                    break;
+                }
+                case L'D': {
+                    const wchar_t* s = param_start;
+                    int chars = num(s, 1);
+                    cursor_pos.X -= min(cursor_pos.X, chars);
+                    break;
+                }
+                case L'G': {
+                    const wchar_t* s = param_start;
+                    int pos = num(s, 1) - 1;
+                    cursor_pos.X = max(0, min(tb.size.X - 1, pos));
+                    break;
+                }
+                case L'd': {
+                    const wchar_t* s = param_start;
+                    int pos = num(s, 1) - 1;
+                    cursor_pos.Y = max(0, min(tb.size.Y - 1, pos));
+                    break;
+                }
+                case L'H':
+                case L'f': {
                     const wchar_t* s = param_start;
                     cursor_pos.Y = min(tb.size.Y - 1, num(s, 1) - 1);
                     s++;
@@ -746,7 +791,52 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
                 }
                 Assert(end != nullptr); // partial sequences unsupported
                 switch (*end) {
-                case 'H': {
+                case 'A':
+                case 'F': {
+                    const char* s = param_start;
+                    int lines = num(s, 1);
+                    cursor_pos.Y -= min(cursor_pos.Y, lines);
+                    if (*end == 'F') {
+                        cursor_pos.X = 0;
+                    }
+                    break;
+                }
+                case 'B':
+                case 'E': {
+                    const char* s = param_start;
+                    int lines = num(s, 1);
+                    cursor_pos.Y = min(tb.size.Y - 1, cursor_pos.Y + lines);
+                    if (*end == 'E') {
+                        cursor_pos.X = 0;
+                    }
+                    break;
+                }
+                case 'C': {
+                    const char* s = param_start;
+                    int chars = num(s, 1);
+                    cursor_pos.X = min(tb.size.X - 1, cursor_pos.X + chars);
+                    break;
+                }
+                case 'D': {
+                    const char* s = param_start;
+                    int chars = num(s, 1);
+                    cursor_pos.X -= min(cursor_pos.X, chars);
+                    break;
+                }
+                case 'G': {
+                    const char* s = param_start;
+                    int pos = num(s, 1) - 1;
+                    cursor_pos.X = max(0, min(tb.size.X - 1, pos));
+                    break;
+                }
+                case 'd': {
+                    const char* s = param_start;
+                    int pos = num(s, 1) - 1;
+                    cursor_pos.Y = max(0, min(tb.size.Y - 1, pos));
+                    break;
+                }
+                case 'H':
+                case 'f': {
                     const char* s = param_start;
                     cursor_pos.Y = min(tb.size.Y - 1, num(s, 1) - 1);
                     s++;
@@ -2061,8 +2151,9 @@ void SetupConsoleAndProcess()
 
     // This should be enough for Conhost setup
 
-    WCHAR cmd[] = L"C:/tools/termbench_release_msvc.exe";
+    //WCHAR cmd[] = L"C:/tools/termbench_release_msvc.exe";
     //WCHAR cmd[] = L"cmd.exe";
+    WCHAR cmd[] = L"bash.exe";
     //WCHAR cmd[] = L"C:/stuff/console_test/Debug/console_test.exe";
 
     BOOL ok;
