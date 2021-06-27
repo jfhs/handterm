@@ -547,6 +547,15 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
                         }
                         break;
                     }
+                    case 39: {
+                        current_attrs.color = default_attrs.color;
+                        current_attrs.bold = default_attrs.bold;
+                        break;
+                    }
+                    case 49: {
+                        current_attrs.backg = default_attrs.backg;
+                        break;
+                    }
                     default:
                         debug_printf(L"Unsupported rendition requested: %d\n", rendition);
                         break;
@@ -589,6 +598,23 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
                 ++str;
                 --count;
                 debug_printf(L"Unknown OSC request %.*s\n", end - param_start + 1, param_start);
+            } else if (*str >= L'\x20' && *str <= L'\x2f') {
+                const wchar_t* param_start = str;
+                const wchar_t* end = nullptr;
+                ++str;
+                --count;
+                while (count) {
+                    if (*str >= L'\x30' || *str <= L'\x7e') {
+                        end = str;
+                        break;
+                    }
+                    ++str;
+                    --count;
+                }
+                Assert(end);
+                ++str;
+                --count;
+                debug_printf_a("Unknown ESC request %.*s\n", end - param_start + 1, param_start);
             } else {
                 ++str;
                 --count;
@@ -868,6 +894,15 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
                         }
                         break;
                     }
+                    case 39: {
+                        current_attrs.color = default_attrs.color;
+                        current_attrs.bold = default_attrs.bold;
+                        break;
+                    }
+                    case 49: {
+                        current_attrs.backg = default_attrs.backg;
+                        break;
+                    }
                     default:
                         debug_printf(L"Unsupported rendition requested: %d\n", rendition);
                         break;
@@ -910,6 +945,23 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
                 ++str;
                 --count;
                 debug_printf_a("Unknown OSC request %.*s\n", end - param_start + 1, param_start);
+            } else if (*str >= '\x20' && *str <= '\x2f') {
+                const char* param_start = str;
+                const char* end = nullptr;
+                ++str;
+                --count;
+                while (count) {
+                    if (*str >= '\x30' || *str <= '\x7e') {
+                        end = str;
+                        break;
+                    }
+                    ++str;
+                    --count;
+                }
+                Assert(end);
+                ++str;
+                --count;
+                debug_printf_a("Unknown ESC request %.*s\n", end - param_start + 1, param_start);
             } else {
                 ++str;
                 --count;
