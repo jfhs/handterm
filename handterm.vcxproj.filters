@@ -33,12 +33,21 @@
     <ClInclude Include="colors.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="shared.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="vtparser.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="handterm.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="handles.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="vtparser.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

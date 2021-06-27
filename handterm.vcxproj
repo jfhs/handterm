@@ -142,6 +142,7 @@
   <ItemGroup>
     <ClCompile Include="handles.cpp" />
     <ClCompile Include="handterm.cpp" />
+    <ClCompile Include="vtparser.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="colors.h" />
@@ -150,6 +151,8 @@
     <ClInclude Include="conmsgl1.h" />
     <ClInclude Include="conmsgl2.h" />
     <ClInclude Include="conmsgl3.h" />
+    <ClInclude Include="shared.h" />
+    <ClInclude Include="vtparser.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

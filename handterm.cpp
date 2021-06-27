@@ -15,9 +15,8 @@
 #include <stdbool.h>
 #include "condefs.h"
 #include "colors.h"
-
-#define Assert(cond) do { if (!(cond)) __debugbreak(); } while (0)
-#define AssertHR(hr) Assert(SUCCEEDED(hr))
+#include "shared.h"
+#include "vtparser.h"
 
 static wchar_t dbg_buf[256] = { 0 };
 void debug_printf(const wchar_t* format, ...) {
@@ -87,7 +86,8 @@ typedef struct TermOutputBuffer {
     COORD line_input_saved_cursor;
     COORD size;
     uint32_t scrollback_available; // number of lines of current width "above" buffer that are available. can wrap to the bottom ((char*)buffer_start + buf_size)
-    uint32_t scrollback; // this is "absolute" value, from buffer_start, NOT from buffer
+    uint32_t scrollback; // in lines, above current view, shouldn't be higher than scrollbac_available
+    vt_parse_state vt_state; // tracks vt state, when enabled
 } TermOutputBuffer;
 
 TermOutputBuffer frontbuffer = { 0 };
@@ -129,6 +129,8 @@ int max(int a, int b) {
     return a > b ? a : b;
 }
 
+#define DEFAULT_VT_BUFFER_SIZE 64
+
 bool initialize_term_output_buffer(TermOutputBuffer& tb, COORD size, bool zeromem) {
     size_t requested_size = size.X * (size.Y + default_scrollback) * sizeof(tb.buffer[0]);
     if (tb.buf_size < requested_size) {
@@ -149,6 +151,10 @@ bool initialize_term_output_buffer(TermOutputBuffer& tb, COORD size, bool zerome
     tb.scrollback_available = 0;
     tb.scrollback = 0;
     tb.size = size;
+    if (!tb.vt_state.buffer) {
+        tb.vt_state.buffer_size = DEFAULT_VT_BUFFER_SIZE;
+        tb.vt_state.buffer = (char*)malloc(tb.vt_state.buffer_size);
+    }
     return true;
 }
 
@@ -354,19 +360,6 @@ static int num(const char*& str, int def = 0)
     return (it && r) ? r : def;
 }
 
-inline bool is_csi_terminal_char_a(char c) {
-    return c >= '\x40' && c <= '\x7e';
-}
-inline bool is_csi_terminal_char_w(wchar_t c) {
-    return c >= L'\x40' && c <= L'\x7e';
-}
-inline bool is_csi_immediate_char_a(char c) {
-    return c >= '\x20' && c <= '\x2f';
-}
-inline bool is_csi_immediate_char_w(wchar_t c) {
-    return c >= L'\x20' && c <= L'\x2f';
-}
-
 // TODO TODO: can this be deduped please?
 void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T count)
 {
@@ -375,29 +368,19 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
     bool vt_processing_enabled = output_console_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     while (count != 0)
     {
-        if (vt_processing_enabled && *str == L'\x1b')
+        vt_action action = Ignore;
+        wchar_t c = *str;
+        if (vt_processing_enabled)
         {
+            action = vt_process_char_w(&tb.vt_state, str, count == 1);
             str++;
             count--;
-            Assert(count);
 
-            if (*str == L'[') {
-                ++str;
-                --count;
-                const wchar_t* param_start = str;
-                const wchar_t* immediate_start = str;
-                const wchar_t* end = nullptr;
-                while (count) {
-                    if (is_csi_terminal_char_w(*str)) {
-                        end = str;
-                        break;
-                    } else if (is_csi_terminal_char_w(*str)) {
-                        immediate_start = str;
-                    }
-                    ++str;
-                    --count;
-                }
-                Assert(end != nullptr); // partial sequences unsupported
+            switch (action) {
+            case CsiDispatch: {
+                const wchar_t* param_start = (const wchar_t*)tb.vt_state.params_start;
+                const wchar_t* immediate_start = (const wchar_t*)tb.vt_state.intermediate_start;
+                const wchar_t* end = (const wchar_t*)tb.vt_state.end;
                 switch (*end) {
                 case L'A':
                 case L'F': {
@@ -523,7 +506,7 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
                         current_attrs.backg = temp;
                         break;
                     }
-                    // programming languages are great!
+                           // programming languages are great!
                     case 30:
                     case 31:
                     case 32:
@@ -539,7 +522,7 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
                     case 44:
                     case 45:
                     case 46:
-                    case 47: 
+                    case 47:
                     case 90:
                     case 91:
                     case 92:
@@ -555,7 +538,7 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
                     case 104:
                     case 105:
                     case 106:
-                    case 107: 
+                    case 107:
                     {
                         BOOL fg = rendition < 40 || rendition >= 90 && rendition < 100;
                         int idx = rendition - (fg ? 30 : 40);
@@ -636,160 +619,138 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
                     break;
                 }
                 }
-                ++str;
-                --count;
-            } else if (*str == L']') {
-                ++str;
-                --count;
-                const wchar_t* param_start = str;
-                const wchar_t* end = nullptr;
-                while (count) {
-                    if (*str == L'\x9c' || *str == L'\a') {
-                        end = str;
-                        break;
-                    }
-                    ++str;
-                    --count;
-                }
-                Assert(end);
-                ++str;
-                --count;
+                break;
+            }
+            case OscDispatch: {
+                const wchar_t* param_start = (const wchar_t*)tb.vt_state.params_start;
+                const wchar_t* immediate_start = (const wchar_t*)tb.vt_state.intermediate_start;
+                const wchar_t* end = (const wchar_t*)tb.vt_state.end;
                 debug_printf(L"Unknown OSC request %.*s\n", end - param_start + 1, param_start);
-            } else if (*str >= L'\x20' && *str <= L'\x2f') {
-                const wchar_t* param_start = str;
-                const wchar_t* end = nullptr;
-                ++str;
-                --count;
-                while (count) {
-                    if (*str >= L'\x30' || *str <= L'\x7e') {
-                        end = str;
-                        break;
-                    }
-                    ++str;
-                    --count;
-                }
-                Assert(end);
-                ++str;
-                --count;
+                break;
+            }
+            case EscDispatch: {
+                const wchar_t* param_start = (const wchar_t*)tb.vt_state.params_start;
+                const wchar_t* end = (const wchar_t*)tb.vt_state.end;
                 debug_printf_a("Unknown ESC request %.*s\n", end - param_start + 1, param_start);
-            } else {
-                ++str;
-                --count;
-                debug_printf(L"Unknown ESC code %d\n", (char)*str);
+                break;
             }
+            case DcsDispatch: {
+                const wchar_t* param_start = (const wchar_t*)tb.vt_state.params_start;
+                const wchar_t* end = (const wchar_t*)tb.vt_state.end;
+                debug_printf_a("Unknown DCS request %.*s\n", end - param_start + 1, param_start);
+                break;
+            }
+            }
+        } else {
+            action = is_cmd_char_w(*str) ? Execute : Print;
+            ++str;
+            --count;
         }
-        // backspace
-        else if (*str == L'\b') {
-            bool overwrite = true;            
-            COORD backup_limit = { 0, 0 };
-            // todo: this should only be done for echoed input characters, not any backspace that app writes
-            if (input_console_mode & ENABLE_LINE_INPUT) {
-                backup_limit = tb.line_input_saved_cursor;
-            }
+        if (action == Execute) {
+            switch(c) {
+            // backspace
+            case L'\b': {
+                bool overwrite = true;
+                COORD backup_limit = { 0, 0 };
+                // todo: this should only be done for echoed input characters, not any backspace that app writes
+                if (input_console_mode & ENABLE_LINE_INPUT) {
+                    backup_limit = tb.line_input_saved_cursor;
+                }
 
-            if (!cursor_pos.X) {
-                if (cursor_pos.Y > backup_limit.Y) {
-                    --cursor_pos.Y;
-                    cursor_pos.X = size.X - 1;
+                if (!cursor_pos.X) {
+                    if (cursor_pos.Y > backup_limit.Y) {
+                        --cursor_pos.Y;
+                        cursor_pos.X = size.X - 1;
+                    } else {
+                        // nowhere to backup
+                        overwrite = false;
+                    }
                 } else {
-                    // nowhere to backup
-                    overwrite = false;
+                    if (cursor_pos.Y > backup_limit.Y || cursor_pos.X > backup_limit.X) {
+                        cursor_pos.X--;
+                    } else {
+                        // nowhere to backup
+                        overwrite = false;
+                    }
                 }
-            } else {
-                if (cursor_pos.Y > backup_limit.Y || cursor_pos.X > backup_limit.X) {
-                    cursor_pos.X--;
-                } else {
-                    // nowhere to backup
-                    overwrite = false;
+                if (overwrite) {
+                    TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
+                    t->ch = ' ';
+                    t->attr = current_attrs;
                 }
+                break;
             }
-            if (overwrite) {
+            case L'\r': {
+                cursor_pos.X = 0;
+                break;
+            }
+            case L'\n': {
+                cursor_pos.X = 0;
+                cursor_pos.Y++;
+                if (cursor_pos.Y >= size.Y) {
+                    scroll_up(tb, cursor_pos.Y - size.Y + 1);
+                }
+                // write space without advancing just to mark this line as "used"
                 TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
-                t->ch = ' ';
-                t->attr = current_attrs;
+                if (!t->ch) {
+                    t->ch = L' ';
+                    t->attr = current_attrs;
+                }
+                break;
             }
-            str++;
-            count--;
-        }
-        else if (*str == L'\r') {
-            cursor_pos.X = 0;
-            str++;
-            count--;
-        }
-        else if (*str == L'\n') {
-            cursor_pos.X = 0;
-            cursor_pos.Y++;
-            if (cursor_pos.Y >= size.Y) {
-                scroll_up(tb, cursor_pos.Y - size.Y + 1);
+            case L'\a': {
+                // bell
+                PlaySoundW((LPCWSTR)SND_ALIAS_SYSTEMHAND, nullptr, SND_ALIAS_ID | SND_ASYNC | SND_SENTRY);
+                break;
             }
-            // write space without advancing just to mark this line as "used"
-            TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
-            if (!t->ch) {
-                t->ch = L' ';
-                t->attr = current_attrs;
             }
-            str++;
-            count--;
-        } else if (*str == L'\a') {
-            // bell
-            str++;
-            count--;
-            PlaySoundW((LPCWSTR)SND_ALIAS_SYSTEMHAND, nullptr, SND_ALIAS_ID | SND_ASYNC | SND_SENTRY);
-        } else
+        } 
+        else if (action == Print)
         {
-            // todo: also do that if cursor moves beyond and WRAP_AT_EOL_OUTPUT is enabled
             if (cursor_pos.Y >= size.Y) {
                 scroll_up(tb, cursor_pos.Y - size.Y + 1);
             }
             if (cursor_pos.X >= 0 && cursor_pos.X < size.X && cursor_pos.Y >= 0 && cursor_pos.Y < size.Y)
             {
                 TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
-                t->ch = *str;
+                t->ch = c;
                 t->attr = current_attrs;
 
                 cursor_pos.X++;
                 if (cursor_pos.X == size.X)
                 {
+                    // todo: only do that if WRAP_AT_EOL_OUTPUT is enabled
                     cursor_pos.X = 0;
                     cursor_pos.Y++;
                     t->attr.soft_wrap = true;
                 }
             }
-            str++;
-            count--;
         }
     }
 }
+
 void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T count)
 {
     COORD& cursor_pos = tb.cursor_pos;
     COORD& size = tb.size;
     bool vt_processing_enabled = output_console_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    int i = 0;
     while (count != 0)
     {
-        if (vt_processing_enabled && *str == '\x1b')
+        ++i;        
+        vt_action action = Ignore;
+        char c = *str;
+        if (vt_processing_enabled)
         {
+            action = vt_process_char_a(&tb.vt_state, str, count == 1);
             str++;
             count--;
-            Assert(count);
 
-            if (*str == '[') {
-                ++str;
-                --count;
-                const char* param_start = str;
-                const char* immediate_start = str;
-                const char* end = nullptr;
-                while (count) {
-                    if (is_csi_terminal_char_a(*str)) {
-                        end = str;
-                        break;
-                    } else if (is_csi_terminal_char_a(*str)) {
-                        immediate_start = str;
-                    }
-                    ++str;
-                    --count;
-                }
-                Assert(end != nullptr); // partial sequences unsupported
+            switch (action) {
+            case CsiDispatch: {
+                const char* param_start = (const char*)tb.vt_state.params_start;
+                const char* immediate_start = (const char*)tb.vt_state.intermediate_start;
+                const char* end = (const char*)tb.vt_state.end;
                 switch (*end) {
                 case 'A':
                 case 'F': {
@@ -1028,123 +989,112 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
                     break;
                 }
                 }
-                ++str;
-                --count;
-            } else if (*str == ']') {
-                ++str;
-                --count;
-                const char* param_start = str;
-                const char* end = nullptr;
-                while (count) {
-                    if (*str == '\x9c' || *str == '\a') {
-                        end = str;
-                        break;
-                    }
-                    ++str;
-                    --count;
-                }
-                Assert(end);
-                ++str;
-                --count;
+                break;
+            }
+            case OscDispatch: {
+                const char* param_start = (const char*)tb.vt_state.params_start;
+                const char* immediate_start = (const char*)tb.vt_state.intermediate_start;
+                const char* end = (const char*)tb.vt_state.end;
                 debug_printf_a("Unknown OSC request %.*s\n", end - param_start + 1, param_start);
-            } else if (*str >= '\x20' && *str <= '\x2f') {
-                const char* param_start = str;
-                const char* end = nullptr;
-                ++str;
-                --count;
-                while (count) {
-                    if (*str >= '\x30' || *str <= '\x7e') {
-                        end = str;
-                        break;
-                    }
-                    ++str;
-                    --count;
-                }
-                Assert(end);
-                ++str;
-                --count;
+                break;
+            }
+            case EscDispatch: {
+                const wchar_t* param_start = (const wchar_t*)tb.vt_state.params_start;
+                const wchar_t* end = (const wchar_t*)tb.vt_state.end;
                 debug_printf_a("Unknown ESC request %.*s\n", end - param_start + 1, param_start);
-            } else {
-                ++str;
-                --count;
-                debug_printf_a("Unknown ESC code %d\n", (char)*str);
+                break;
             }
+            case DcsDispatch: {
+                const wchar_t* param_start = (const wchar_t*)tb.vt_state.params_start;
+                const wchar_t* end = (const wchar_t*)tb.vt_state.end;
+                debug_printf_a("Unknown DCS request %.*s\n", end - param_start + 1, param_start);
+                break;
+            }
+            }
+        } else {
+            action = is_cmd_char_a(*str) ? Execute : Print;
+            ++str;
+            --count;
         }
-        // backspace
-        else if (*str == '\b') {
-            bool overwrite = true;
-            COORD backup_limit = { 0, 0 };
-            // todo: this should only be done for echoed input characters, not any backspace that app writes
-            if (input_console_mode & ENABLE_LINE_INPUT) {
-                backup_limit = tb.line_input_saved_cursor;
-            }
+        if (action == Execute) {
+            switch (c) {
+                // backspace
+            case '\b': {
+                bool overwrite = true;
+                COORD backup_limit = { 0, 0 };
+                // todo: this should only be done for echoed input characters, not any backspace that app writes
+                if (input_console_mode & ENABLE_LINE_INPUT) {
+                    backup_limit = tb.line_input_saved_cursor;
+                }
 
-            if (!cursor_pos.X) {
-                if (cursor_pos.Y > backup_limit.Y) {
-                    --cursor_pos.Y;
-                    cursor_pos.X = size.X - 1;
+                if (!cursor_pos.X) {
+                    if (cursor_pos.Y > backup_limit.Y) {
+                        --cursor_pos.Y;
+                        cursor_pos.X = size.X - 1;
+                    } else {
+                        // nowhere to backup
+                        overwrite = false;
+                    }
                 } else {
-                    // nowhere to backup
-                    overwrite = false;
+                    if (cursor_pos.Y > backup_limit.Y || cursor_pos.X > backup_limit.X) {
+                        cursor_pos.X--;
+                    } else {
+                        // nowhere to backup
+                        overwrite = false;
+                    }
                 }
-            } else {
-                if (cursor_pos.Y > backup_limit.Y || cursor_pos.X > backup_limit.X) {
-                    cursor_pos.X--;
-                } else {
-                    // nowhere to backup
-                    overwrite = false;
+                if (overwrite) {
+                    TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
+                    t->ch = ' ';
+                    t->attr = current_attrs;
                 }
+                break;
             }
-            if (overwrite) {
+            case '\r': {
+                cursor_pos.X = 0;
+                break;
+            }
+            case '\n': {
+                cursor_pos.X = 0;
+                cursor_pos.Y++;
+                if (cursor_pos.Y >= size.Y) {
+                    scroll_up(tb, cursor_pos.Y - size.Y + 1);
+                }
+                // write space without advancing just to mark this line as "used"
                 TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
-                t->ch = ' ';
-                t->attr = current_attrs;
+                if (!t->ch) {
+                    t->ch = L' ';
+                    t->attr = current_attrs;
+                }
+                break;
             }
-            str++;
-            count--;
-        } else if (*str == '\r') {
-            cursor_pos.X = 0;
-            str++;
-            count--;
-        } else if (*str == '\n') {
-            cursor_pos.X = 0;
-            cursor_pos.Y++;
-            if (cursor_pos.Y >= size.Y) {
-                scroll_up(tb, cursor_pos.Y - size.Y + 1);
+            case '\a': {
+                // bell
+                PlaySoundW((LPCWSTR)SND_ALIAS_SYSTEMHAND, nullptr, SND_ALIAS_ID | SND_ASYNC | SND_SENTRY);
+                break;
             }
-            // write space without advancing just to mark this line as "used"
-            TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
-            t->ch = ' ';
-            t->attr = current_attrs;
-            str++;
-            count--;
-        } else if (*str == '\a') {
-            // bell
-            str++;
-            count--;
-            PlaySoundW((LPCWSTR)SND_ALIAS_SYSTEMHAND, nullptr, SND_ALIAS_ID | SND_ASYNC | SND_SENTRY);
-        } else
+            }
+        } 
+        else if (action == Print)
         {
-            // todo: also do that if cursor moves beyond and WRAP_AT_EOL_OUTPUT is enabled
             if (cursor_pos.Y >= size.Y) {
                 scroll_up(tb, cursor_pos.Y - size.Y + 1);
             }
             if (cursor_pos.X >= 0 && cursor_pos.X < size.X && cursor_pos.Y >= 0 && cursor_pos.Y < size.Y)
             {
                 TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
-                t->ch = *str;
+                t->ch = c;
                 t->attr = current_attrs;
 
                 cursor_pos.X++;
                 if (cursor_pos.X == size.X)
                 {
+                    // todo: only do that if WRAP_AT_EOL_OUTPUT is enabled
                     cursor_pos.X = 0;
                     cursor_pos.Y++;
                     t->attr.soft_wrap = true;
                 }
             }
-            str++;
-            count--;
         }
     }
 }
@@ -2152,8 +2102,8 @@ void SetupConsoleAndProcess()
     // This should be enough for Conhost setup
 
     //WCHAR cmd[] = L"C:/tools/termbench_release_msvc.exe";
-    //WCHAR cmd[] = L"cmd.exe";
-    WCHAR cmd[] = L"bash.exe";
+    WCHAR cmd[] = L"cmd.exe";
+    //WCHAR cmd[] = L"bash.exe";
     //WCHAR cmd[] = L"C:/stuff/console_test/Debug/console_test.exe";
 
     BOOL ok;
@@ -2507,8 +2457,8 @@ int WINAPI WinMain(
     GetClientRect(window, &rect);
     DWORD width = rect.right - rect.left;
     DWORD height = rect.bottom - rect.top;
-    FastFast_Resize((SHORT)(width / 8), (SHORT)(height / 16));
-
+    COORD size = { (SHORT)(width / 8), (SHORT)(height / 16) };
+    initialize_term_output_buffer(frontbuffer, size, true);
     SetupConsoleAndProcess();
 
     while(!console_exit)
