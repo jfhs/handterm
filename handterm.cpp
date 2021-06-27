@@ -1,4 +1,5 @@
 #define _CRT_SECURE_NO_DEPRECATE
+#define NOMINMAX
 #include <windows.h>
 #include <ntstatus.h>
 #include <d3d11.h>
@@ -120,6 +121,13 @@ HANDLE processes[32];
 size_t process_count = 0;
 
 // END GLOBALS
+
+int min(int a, int b) {
+    return a < b ? a : b;
+}
+int max(int a, int b) {
+    return a > b ? a : b;
+}
 
 bool initialize_term_output_buffer(TermOutputBuffer& tb, COORD size, bool zeromem) {
     size_t requested_size = size.X * (size.Y + default_scrollback) * sizeof(tb.buffer[0]);
@@ -322,24 +330,28 @@ void FastFast_Resize(SHORT width, SHORT height) {
 }
 
 static int num(const wchar_t*& str, int def = 0)
-{
-    int r = def;
+{    
+    int r = 0;
+    int it = 0;
     while (*str >= L'0' && *str <= L'9')
     {
         r *= 10;
         r += *str++ - '0';
+        ++it;
     }
-    return r;
+    return it ? r : def;
 }
 static int num(const char*& str, int def = 0)
 {
-    int r = def;
+    int r = 0;
+    int it = 0;
     while (*str >= '0' && *str <= '9')
     {
         r *= 10;
         r += *str++ - '0';
+        ++it;
     }
-    return r;
+    return it ? r : def;
 }
 
 inline bool is_csi_terminal_char_a(char c) {
@@ -2049,8 +2061,8 @@ void SetupConsoleAndProcess()
 
     // This should be enough for Conhost setup
 
-    //WCHAR cmd[] = L"C:/tools/termbench_release_msvc.exe";
-    WCHAR cmd[] = L"cmd.exe";
+    WCHAR cmd[] = L"C:/tools/termbench_release_msvc.exe";
+    //WCHAR cmd[] = L"cmd.exe";
     //WCHAR cmd[] = L"C:/stuff/console_test/Debug/console_test.exe";
 
     BOOL ok;
