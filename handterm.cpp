@@ -128,6 +128,18 @@ int min(int a, int b) {
 int max(int a, int b) {
     return a > b ? a : b;
 }
+uint32_t min(uint32_t a, uint32_t b) {
+    return a < b ? a : b;
+}
+uint32_t max(uint32_t a, uint32_t b) {
+    return a > b ? a : b;
+}
+size_t min(size_t a, size_t b) {
+    return a < b ? a : b;
+}
+size_t max(size_t a, size_t b) {
+    return a > b ? a : b;
+}
 
 #define DEFAULT_VT_BUFFER_SIZE 64
 
@@ -215,7 +227,7 @@ void scroll_down(TermOutputBuffer& tb, UINT lines) {
 
 void scroll_up(TermOutputBuffer& tb, UINT lines) {
     tb.cursor_pos.Y -= lines;
-    tb.scrollback_available = min(default_scrollback, tb.scrollback_available + lines);
+    tb.scrollback_available = min((uint32_t)default_scrollback, tb.scrollback_available + lines);
     if (tb.scrollback) {
         if (++tb.scrollback > tb.scrollback_available) {
             tb.scrollback = tb.scrollback_available;
@@ -1101,11 +1113,115 @@ void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T coun
 
 const size_t DEFAULT_BUF_SIZE = 128;
 
-thread_local char* buf = 0;
-thread_local size_t buf_size = 0;
-thread_local size_t buf_bytes_read = 0;
-thread_local size_t buf_bytes_written = 0;
-thread_local size_t buf_write_idx = 0;
+thread_local char* input_buf = 0;
+thread_local size_t input_buf_size = 0;
+thread_local size_t input_buf_bytes_read = 0;
+thread_local size_t input_buf_bytes_written = 0;
+thread_local size_t input_buf_write_idx = 0;
+
+thread_local char* output_buf = 0;
+thread_local size_t output_buf_size = 0;
+thread_local size_t output_buf_bytes_read = 0;
+thread_local size_t output_buf_bytes_written = 0;
+thread_local size_t output_buf_write_idx = 0;
+
+// todo: can we avoid using globals?
+bool map_key_event_as_vt_seq(KEY_EVENT_RECORD* key_event, bool unicode, char* buffer, size_t buffer_size, size_t* ch_written) {
+    bool ctrl_pressed = key_event->dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED);
+    bool alt_pressed = key_event->dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED);
+    WORD vk = key_event->wVirtualKeyCode;
+    const char* code = nullptr;
+    char seq_buf[3] = { 0 };
+    bool app_mode = true;
+    if (ctrl_pressed && !alt_pressed) {
+        if (vk == VK_UP) {
+            code = "\x1b[1;5A";
+        } else if (vk == VK_DOWN) {
+            code = "\x1b[1;5B";
+        } else if (vk == VK_RIGHT) {
+            code = "\x1b[1;5C";
+        } else if (vk == VK_LEFT) {
+            code = "\x1b[1;5D";
+        } else if (vk == VK_SPACE) {
+            code = seq_buf; // todo: fixme, this doesn't actually write null byte!
+        } else {
+            seq_buf[0] = '\x1b';
+            // todo: we never get here if AsciiChar is 0, so this should do something else
+            // seq_buf[1] = key_event->uChar.AsciiChar - '\x40';
+            code = seq_buf;
+        }
+    } else if (!ctrl_pressed && !alt_pressed) {
+        if (vk == VK_UP) {
+            code = app_mode ? "\x1bOA" : "\x1b[A";
+        } else if (vk == VK_DOWN) {
+            code = app_mode ? "\x1bOB" : "\x1b[B";
+        } else if (vk == VK_RIGHT) {
+            code = app_mode ? "\x1bOC" : "\x1b[C";
+        } else if (vk == VK_LEFT) {
+            code = app_mode ? "\x1bOD" : "\x1b[D";
+        } else if (vk == VK_HOME) {
+            code = app_mode ? "\x1bOH" : "\x1b[H";
+        } else if (vk == VK_END) {
+            code = app_mode ? "\x1bOF" : "\x1b[F";
+        } else if (vk == VK_BACK) {
+            code = "\x7f";
+        } else if (vk == VK_PAUSE) {
+            code = "\x1a";
+        } else if (vk == VK_ESCAPE) {
+            code = "\x1b";
+        } else if (vk == VK_INSERT) {
+            code = "\x1b[2~";
+        } else if (vk == VK_DELETE) {
+            code = "\x1b[3~";
+        } else if (vk == VK_PRIOR) {
+            code = "\x1b[5~";
+        } else if (vk == VK_NEXT) {
+            code = "\x1b[6~";
+        } else if (vk == VK_F1) {
+            code = "\x1bOP";
+        } else if (vk == VK_F2) {
+            code = "\x1bOQ";
+        } else if (vk == VK_F3) {
+            code = "\x1bOR";
+        } else if (vk == VK_F4) {
+            code = "\x1bOS";
+        } else if (vk == VK_F5) {
+            code = "\x1b[15~";
+        } else if (vk == VK_F6) {
+            code = "\x1b[17~";
+        } else if (vk == VK_F7) {
+            code = "\x1b[18~";
+        } else if (vk == VK_F8) {
+            code = "\x1b[19~";
+        } else if (vk == VK_F9) {
+            code = "\x1b[20~";
+        } else if (vk == VK_F10) {
+            code = "\x1b[21~";
+        } else if (vk == VK_F11) {
+            code = "\x1b[23~";
+        } else if (vk == VK_F12) {
+            code = "\x1b[24~";
+        }
+    }
+    if (code != nullptr) {
+        size_t chars = strlen(code);
+        size_t bytes = chars * (unicode ? 2 : 1);
+        if (bytes > buffer_size) {
+            return false;
+        }
+        for (size_t i = 0; i < chars; ++i) {
+            if (unicode) {
+                ((wchar_t*)buffer)[i] = code[i];
+            } else {
+                buffer[i] = code[i];
+            }
+        }
+        *ch_written = chars;
+        return true;
+    }
+    *ch_written = 0;
+    return true;
+}
 
 HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_complete) {
     DWORD BytesRead = 0;
@@ -1113,9 +1229,9 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
     BOOL ok;
 
     // todo: this should be part of thread initialization to avoid this check on every message
-    if (!buf_size) {
-        buf = (char*)malloc(DEFAULT_BUF_SIZE);
-        buf_size = DEFAULT_BUF_SIZE;
+    if (!input_buf_size) {
+        input_buf = (char*)malloc(DEFAULT_BUF_SIZE);
+        input_buf_size = DEFAULT_BUF_SIZE;
     }
 
     ULONG user_write_buffer_size = ReceiveMsg->Descriptor.OutputSize - ReceiveMsg->msgHeader.ApiDescriptorSize;
@@ -1131,7 +1247,7 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
             return STATUS_UNSUCCESSFUL;
         }
 
-        wchar_t* wbuf = (wchar_t*)buf;
+        wchar_t* wbuf = (wchar_t*)input_buf;
         // todo: mode should probably be copy-stored for delayed IO
         bool line_mode_enabled = input_console_mode & ENABLE_LINE_INPUT;
 
@@ -1141,24 +1257,34 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
         write_op.Buffer.Offset = ReceiveMsg->Descriptor.Function == CONSOLE_IO_RAW_READ ? 0 : ReceiveMsg->msgHeader.ApiDescriptorSize;
 
         bool abort_input = false;
+        bool vt_input_enabled = input_console_mode & ENABLE_VIRTUAL_TERMINAL_INPUT;
 
         if (!line_mode_enabled) {  
             while (read_ptr != write_ptr) {
                 // it's expected that in this mode we just skip other events
-                if (read_ptr->EventType == KEY_EVENT && read_ptr->Event.KeyEvent.uChar.UnicodeChar && read_ptr->Event.KeyEvent.bKeyDown) {
+                if (read_ptr->EventType == KEY_EVENT && read_ptr->Event.KeyEvent.bKeyDown) {
                     // todo: support repeat
                     Assert(read_ptr->Event.KeyEvent.wRepeatCount == 1);
-
-                    buf_bytes_written += read_msg->Unicode ? 2 : 1;
-                    // without line mode we can return any amount of data
-                    // and we should also stop reading as soon as we have enough data in buffer
-                    if (buf_bytes_written && (buf_bytes_written > buf_size || buf_bytes_written > user_write_buffer_size)) {
-                        break;
-                    }
-                    if (read_msg->Unicode) {
-                        wbuf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.UnicodeChar;
-                    } else {
-                        buf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.AsciiChar;
+                    if (read_ptr->Event.KeyEvent.uChar.UnicodeChar) {
+                        size_t bytes = read_msg->Unicode ? 2 : 1;
+                        // without line mode we can return any amount of data
+                        // and we should also stop reading as soon as we have enough data in buffer
+                        if (input_buf_bytes_written && (input_buf_bytes_written + bytes > input_buf_size || input_buf_bytes_written + bytes > user_write_buffer_size)) {
+                            break;
+                        }
+                        if (read_msg->Unicode) {
+                            wbuf[input_buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.UnicodeChar;
+                        } else {
+                            input_buf[input_buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.AsciiChar;
+                        }
+                        input_buf_bytes_written += bytes;
+                    } else if (vt_input_enabled) {
+                        size_t written = 0;
+                        size_t bytes_left = min(user_write_buffer_size, input_buf_size) - input_buf_bytes_written;
+                        if (!map_key_event_as_vt_seq(&read_ptr->Event.KeyEvent, read_msg->Unicode, input_buf + input_buf_bytes_written, bytes_left, &written)) {
+                            break;
+                        }
+                        input_buf_bytes_written += written * (read_msg->Unicode ? 2 : 1);
                     }
                 }
                 if (++read_ptr == pending_events_wrap_ptr) {
@@ -1173,14 +1299,14 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                 ResetEvent(InputEventHandle);
             }
 
-            if (!buf_bytes_written) {
+            if (!input_buf_bytes_written) {
                 return STATUS_TIMEOUT;
             }
-            write_op.Buffer.Data = buf;
-            write_op.Buffer.Size = buf_bytes_written;
+            write_op.Buffer.Data = input_buf;
+            write_op.Buffer.Size = input_buf_bytes_written;
         } else {
             // no data available to read right away, buffer until we get CR
-            if (!buf_bytes_read) {
+            if (!input_buf_bytes_read) {
                 bool has_cr = false;
                 while (read_ptr != write_ptr) {
                     // it's expected that in this mode we just skip other events
@@ -1207,34 +1333,34 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                             if (is_removing) {
                                 // todo: support other chars
                                 if (read_ptr->Event.KeyEvent.uChar.UnicodeChar == L'\b') {
-                                    if (buf_write_idx) {
-                                        buf_bytes_written -= read_msg->Unicode ? 2 : 1;
+                                    if (input_buf_write_idx) {
+                                        input_buf_bytes_written -= read_msg->Unicode ? 2 : 1;
                                         if (read_msg->Unicode) {
-                                            wbuf[buf_write_idx] = L' ';
+                                            wbuf[input_buf_write_idx] = L' ';
                                         } else {
-                                            buf[buf_write_idx] = ' ';
+                                            input_buf[input_buf_write_idx] = ' ';
                                         }
-                                        --buf_write_idx;
+                                        --input_buf_write_idx;
                                     } else {
                                         // nothing to remove
                                     }
                                 }
                             } else {
-                                buf_bytes_written += (is_cr ? 2 : 1) * (read_msg->Unicode ? 2 : 1);
-                                if (buf_bytes_written > buf_size) {
-                                    buf_size = buf_size * 2;
-                                    buf = (char*)realloc(buf, buf_size);
-                                    wbuf = (wchar_t*)buf;
+                                input_buf_bytes_written += (is_cr ? 2 : 1) * (read_msg->Unicode ? 2 : 1);
+                                if (input_buf_bytes_written > input_buf_size) {
+                                    input_buf_size = input_buf_size * 2;
+                                    input_buf = (char*)realloc(input_buf, input_buf_size);
+                                    wbuf = (wchar_t*)input_buf;
                                 }
                                 if (read_msg->Unicode) {
-                                    wbuf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.UnicodeChar;
+                                    wbuf[input_buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.UnicodeChar;
                                     if (is_cr) {
-                                        wbuf[buf_write_idx++] = L'\n';
+                                        wbuf[input_buf_write_idx++] = L'\n';
                                     }
                                 } else {
-                                    buf[buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.AsciiChar;
+                                    input_buf[input_buf_write_idx++] = read_ptr->Event.KeyEvent.uChar.AsciiChar;
                                     if (is_cr) {
-                                        buf[buf_write_idx++] = '\n';
+                                        input_buf[input_buf_write_idx++] = '\n';
                                     }
                                 }
                             }
@@ -1256,8 +1382,8 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                 }
 
                 if (abort_input) {
-                    buf_bytes_written = 0;
-                    buf_bytes_read = 0;
+                    input_buf_bytes_written = 0;
+                    input_buf_bytes_read = 0;
                 } else {
                     if (input_console_mode & ENABLE_ECHO_INPUT) {
                         FastFast_LockTerminal();
@@ -1269,9 +1395,9 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                         }
                         frontbuffer.cursor_pos = frontbuffer.line_input_saved_cursor;
                         if (read_msg->Unicode) {
-                            FastFast_UpdateTerminalW(frontbuffer, wbuf, buf_write_idx);
+                            FastFast_UpdateTerminalW(frontbuffer, wbuf, input_buf_write_idx);
                         } else {
-                            FastFast_UpdateTerminalA(frontbuffer, buf, buf_write_idx);
+                            FastFast_UpdateTerminalA(frontbuffer, input_buf, input_buf_write_idx);
                         }
                         if (has_cr) {
                             frontbuffer.line_input_saved_cursor = { 0, 0 };
@@ -1285,14 +1411,14 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                     }
                 }
             }
-            if (!buf_bytes_written && !abort_input) {
+            if (!input_buf_bytes_written && !abort_input) {
                 has_pending_line_read = true;
                 return STATUS_TIMEOUT;
             }
             // if we got here, we either got CR or there was some data from previous line read request
-            size_t bytes_left = buf_bytes_written - buf_bytes_read;
+            size_t bytes_left = input_buf_bytes_written - input_buf_bytes_read;
             ULONG bytes_to_write = min(bytes_left, user_write_buffer_size);
-            write_op.Buffer.Data = buf + buf_bytes_read;
+            write_op.Buffer.Data = input_buf + input_buf_bytes_read;
             write_op.Buffer.Size = bytes_to_write;
         }
         
@@ -1300,13 +1426,13 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
         hr = ok ? S_OK : GetLastError();
         Assert(SUCCEEDED(hr));
 
-        buf_bytes_read += write_op.Buffer.Size;
+        input_buf_bytes_read += write_op.Buffer.Size;
         // reset pointers after whole buffer was written to client
-        if (buf_bytes_read == buf_bytes_written) {
+        if (input_buf_bytes_read == input_buf_bytes_written) {
             has_pending_line_read = false;
-            buf_bytes_read = 0;
-            buf_bytes_written = 0;
-            buf_write_idx = 0;
+            input_buf_bytes_read = 0;
+            input_buf_bytes_written = 0;
+            input_buf_write_idx = 0;
         }
 
         io_complete->IoStatus.Information = read_msg->NumBytes = write_op.Buffer.Size;
@@ -1325,61 +1451,106 @@ HRESULT HandleGetInputMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_co
     // write ptr can be modified while we are running, read out value so it doesn't change while we process
     PINPUT_RECORD write_ptr = pending_events_write_ptr;
     PINPUT_RECORD read_ptr = pending_events_read_ptr;
-    if (read_ptr != write_ptr) {
-        // wrapped, just read till the end, next read operation can read chunk at the beginning
-        if (write_ptr < read_ptr) {
-            write_ptr = pending_events_wrap_ptr;
+    ULONG user_write_buffer_size = ReceiveMsg->Descriptor.OutputSize - ReceiveMsg->msgHeader.ApiDescriptorSize;
+
+    // wrapped, just read till the end, next read operation can read chunk at the beginning
+    if (write_ptr < read_ptr) {
+        write_ptr = pending_events_wrap_ptr;
+    }
+
+    bool vt_input_enabled = input_console_mode & ENABLE_VIRTUAL_TERMINAL_INPUT;
+
+    CD_IO_OPERATION write_op = { 0 };
+    write_op.Identifier = ReceiveMsg->Descriptor.Identifier;
+    write_op.Buffer.Offset = ReceiveMsg->msgHeader.ApiDescriptorSize;
+
+    // we have some buffered data
+    if (input_buf_bytes_written) {
+        write_op.Buffer.Data = input_buf + input_buf_bytes_read;
+        write_op.Buffer.Size = min(input_buf_bytes_written - input_buf_bytes_read, user_write_buffer_size);
+    } else {
+        if (!vt_input_enabled) {
+            input_msg->NumRecords = min(user_write_buffer_size / sizeof(INPUT_RECORD), write_ptr - read_ptr);
+            size_t bytes = sizeof(INPUT_RECORD) * input_msg->NumRecords;
+
+            write_op.Buffer.Data = read_ptr;
+            write_op.Buffer.Size = bytes;
+            read_ptr += input_msg->NumRecords;
+        } else {
+            // now if vt is enabled, we have to copy-out all events in case we'll need to expand some
+            // todo: maybe it's fine to send events in chunks (underusing user buffer) until we hit expandable event?
+            PINPUT_RECORD ebuf = (PINPUT_RECORD)input_buf;
+            while (read_ptr != write_ptr) {
+                bool replaced = false;
+                if (read_ptr->EventType == KEY_EVENT && read_ptr->Event.KeyEvent.bKeyDown == true && !read_ptr->Event.KeyEvent.uChar.UnicodeChar) {
+                    size_t written;
+                    char cbuf[8]; // all VT sequences should fit here
+                    // should always succeed as we provide large enough buf
+                    Assert(map_key_event_as_vt_seq(&read_ptr->Event.KeyEvent, false, cbuf, sizeof(cbuf), &written));
+                    if (written != 0) {
+                        size_t bytes = written * sizeof(INPUT_RECORD);
+                        // todo: this can deadlock if client provides too small buffer to fit one translated event
+                        if (input_buf_bytes_written && (input_buf_bytes_written + bytes > input_buf_size || input_buf_bytes_written + bytes > user_write_buffer_size)) {
+                            break;
+                        }
+                        replaced = true;
+                        for (size_t i = 0; i < written; ++i) {
+                            ebuf->EventType = KEY_EVENT;
+                            ebuf->Event.KeyEvent.bKeyDown = true;
+                            ebuf->Event.KeyEvent.dwControlKeyState = 0;
+                            ebuf->Event.KeyEvent.uChar.UnicodeChar = cbuf[i];
+                            ebuf->Event.KeyEvent.wRepeatCount = 1;
+                            ebuf->Event.KeyEvent.wVirtualKeyCode = 0;
+                            ebuf->Event.KeyEvent.wVirtualScanCode = 0;
+                            ++ebuf;
+                        }
+                        input_buf_bytes_written += bytes;
+                    }
+                }
+                if (!replaced) {
+                    size_t bytes = sizeof(INPUT_RECORD);
+                    if (input_buf_bytes_written + bytes > input_buf_size || input_buf_bytes_written + bytes > user_write_buffer_size) {
+                        break;
+                    }
+                    *ebuf++ = *read_ptr;
+                    input_buf_bytes_written += bytes;
+                }
+                read_ptr++;
+            }
+            write_op.Buffer.Data = input_buf;
+            write_op.Buffer.Size = min(input_buf_bytes_written, user_write_buffer_size);
         }
+    }
 
-        input_msg->NumRecords = min(ReceiveMsg->Descriptor.OutputSize / sizeof(INPUT_RECORD), write_ptr - read_ptr);
-
-        size_t bytes = sizeof(INPUT_RECORD) * input_msg->NumRecords;
-
-        CD_IO_OPERATION write_op = { 0 };
-        write_op.Identifier = ReceiveMsg->Descriptor.Identifier;
-        write_op.Buffer.Offset = ReceiveMsg->msgHeader.ApiDescriptorSize;
-        write_op.Buffer.Data = read_ptr;
-        write_op.Buffer.Size = bytes;
+    if (write_op.Buffer.Size || (input_msg->Flags & CONSOLE_READ_NOWAIT)) {
+        input_msg->NumRecords = write_op.Buffer.Size / sizeof(INPUT_RECORD);
 
         ok = DeviceIoControl(ServerHandle, IOCTL_CONDRV_WRITE_OUTPUT, &write_op, sizeof(write_op), 0, 0, &BytesRead, 0);
         hr = ok ? S_OK : GetLastError();
         Assert(SUCCEEDED(hr));
 
-        read_ptr += input_msg->NumRecords;
         if (read_ptr == pending_events_wrap_ptr) {
             read_ptr = pending_events;
         }
 
         if (!(input_msg->Flags & CONSOLE_READ_NOREMOVE)) {
+            input_buf_bytes_read += write_op.Buffer.Size;
+            if (input_buf_bytes_read >= input_buf_bytes_written) {
+                input_buf_bytes_read = 0;
+                input_buf_bytes_written = 0;
+                input_buf_write_idx = 0;
+            }
             pending_events_read_ptr = read_ptr;
             // todo: this is most likely not thread safe
-            if (pending_events_read_ptr == pending_events_write_ptr) {
+            if (!input_buf_bytes_written && pending_events_read_ptr == pending_events_write_ptr) {
                 ResetEvent(InputEventHandle);
             }
         }
 
-        io_complete->IoStatus.Information = bytes;
+        io_complete->IoStatus.Information = write_op.Buffer.Size;
         return STATUS_SUCCESS;
     } else {
-        if (!(input_msg->Flags & CONSOLE_READ_NOWAIT)) {
-            return STATUS_TIMEOUT;
-        } else {
-            // client doesn't want to wait
-            // we still have to do zero write...
-            CD_IO_OPERATION write_op = { 0 };
-            write_op.Identifier = ReceiveMsg->Descriptor.Identifier;
-            write_op.Buffer.Offset = ReceiveMsg->msgHeader.ApiDescriptorSize;
-            write_op.Buffer.Data = read_ptr;
-            write_op.Buffer.Size = 0;
-
-            ok = DeviceIoControl(ServerHandle, IOCTL_CONDRV_WRITE_OUTPUT, &write_op, sizeof(write_op), 0, 0, &BytesRead, 0);
-            hr = ok ? S_OK : GetLastError();
-            Assert(SUCCEEDED(hr));
-
-            input_msg->NumRecords = 0;
-            io_complete->IoStatus.Information = 0;
-            return STATUS_SUCCESS;
-        }
+        return STATUS_TIMEOUT;
     }
 }
 
@@ -1392,14 +1563,14 @@ HRESULT HandleWriteMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_compl
     // no offset with raw requests
     size_t read_offset = ReceiveMsg->Descriptor.Function == CONSOLE_IO_RAW_WRITE ? 0 : ReceiveMsg->msgHeader.ApiDescriptorSize + sizeof(CONSOLE_MSG_HEADER);
     size_t bytes = ReceiveMsg->Descriptor.InputSize - read_offset;
-    if (buf_size < bytes) {
-        buf = (char*)realloc(buf, bytes);
-        buf_size = bytes;
+    if (output_buf_size < bytes) {
+        output_buf = (char*)realloc(output_buf, bytes);
+        output_buf_size = bytes;
     }
     CD_IO_OPERATION read_op = { 0 };
     read_op.Identifier = ReceiveMsg->Descriptor.Identifier;
     read_op.Buffer.Offset = read_offset;
-    read_op.Buffer.Data = buf;
+    read_op.Buffer.Data = output_buf;
     read_op.Buffer.Size = bytes;
     ok = DeviceIoControl(ServerHandle, IOCTL_CONDRV_READ_INPUT, &read_op, sizeof(read_op), 0, 0, &BytesRead, 0);
     hr = ok ? S_OK : GetLastError();
@@ -1407,9 +1578,9 @@ HRESULT HandleWriteMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_compl
 
     FastFast_LockTerminal();
    if (write_msg->Unicode) {
-        FastFast_UpdateTerminalW(frontbuffer, (wchar_t*)buf, bytes / 2);
+        FastFast_UpdateTerminalW(frontbuffer, (wchar_t*)output_buf, bytes / 2);
     } else {
-        FastFast_UpdateTerminalA(frontbuffer, buf, bytes);
+        FastFast_UpdateTerminalA(frontbuffer, output_buf, bytes);
     }
     FastFast_UnlockTerminal();
 
@@ -1539,7 +1710,7 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
             processes[process_count++] = (HANDLE)ReceiveMsg.Descriptor.Process;
 
             if (data.Title && process_count == 1) {
-                memcpy(console_title, data.Title, min(data.TitleLength + 1, sizeof(console_title)));
+                memcpy(console_title, data.Title, min((size_t)data.TitleLength + 1, sizeof(console_title)));
                 console_title[sizeof(console_title) / sizeof(console_title[0]) - 1] = 0;
             }
             FastFast_UnlockTerminal();
@@ -1965,15 +2136,15 @@ static LRESULT CALLBACK WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lPa
                 break;
             }
             case SB_PAGEDOWN: {
-                frontbuffer.scrollback = max(0, frontbuffer.scrollback - frontbuffer.size.Y);
+                frontbuffer.scrollback = max(0, (int)frontbuffer.scrollback - frontbuffer.size.Y);
                 break;
             }
             case SB_PAGEUP: {
-                frontbuffer.scrollback = min(frontbuffer.scrollback_available, frontbuffer.scrollback + frontbuffer.size.Y);
+                frontbuffer.scrollback = min(frontbuffer.scrollback_available, (uint32_t)frontbuffer.scrollback + frontbuffer.size.Y);
                 break;
             }
             case SB_THUMBTRACK: {
-                frontbuffer.scrollback = max(0, min(frontbuffer.scrollback_available, frontbuffer.scrollback_available - HIWORD(wParam)));
+                frontbuffer.scrollback = max(0, min((int)frontbuffer.scrollback_available, (int)frontbuffer.scrollback_available - HIWORD(wParam)));
                 debug_printf(L"Thumbtrack event, wparam.hi=%d scrollback=%d\n", HIWORD(wParam), frontbuffer.scrollback);
                 break;
             }
@@ -2105,6 +2276,7 @@ void SetupConsoleAndProcess()
     WCHAR cmd[] = L"cmd.exe";
     //WCHAR cmd[] = L"bash.exe";
     //WCHAR cmd[] = L"C:/stuff/console_test/Debug/console_test.exe";
+    //WCHAR cmd[] = L"C:/Program Files/Far Manager/Far.exe";
 
     BOOL ok;
     HRESULT hr;
