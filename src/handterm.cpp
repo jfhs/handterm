@@ -16,6 +16,8 @@
 #include "colors.h"
 #include "shared.h"
 #include "vtparser.h"
+#include "terminal.h"
+#include "refterm_example_source_buffer.h"
 
 static wchar_t dbg_buf[256] = { 0 };
 void debug_printf(const wchar_t* format, ...) {
@@ -39,6 +41,7 @@ void debug_printf_a(const char* format, ...) {
 #pragma comment (lib, "d3d11.lib")
 #pragma comment (lib, "d3dcompiler.lib")
 #pragma comment (lib, "Winmm.lib")
+#pragma comment (lib, "usp10")
 
 #define STR2(x) #x
 #define STR(x) STR2(x)
@@ -50,10 +53,9 @@ PfnTranslateMessageEx _TranslateMessageEx;
 // GLOBALS
 HWND window;
 HANDLE window_ready_event;
+HANDLE buffer_update_event;
 HANDLE console_mutex;
 HANDLE ServerHandle, ReferenceHandle, InputEventHandle;
-#define MAX_WIDTH 4096
-#define MAX_HEIGHT 4096
 
 // in terminal size
 #define MIN_WIDTH 32
@@ -65,34 +67,19 @@ HANDLE ServerHandle, ReferenceHandle, InputEventHandle;
 ULONG input_console_mode = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_MOUSE_INPUT | ENABLE_INSERT_MODE | ENABLE_EXTENDED_FLAGS | ENABLE_AUTO_POSITION;
 ULONG output_console_mode = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
 
-typedef struct CharAttributes {
-    int color;    
-    int backg;
-    bool bold;
-    bool soft_wrap;
-} CharAttributes;
-
-typedef struct TermChar {
-    int ch;
-    CharAttributes attr;
-} TermChar;
-
-typedef struct TermOutputBuffer {
-    TermChar* buffer; // left top corner of actual console buffer, cursor_pos {0 0} is here
-    TermChar* buffer_start; // actual start of the allocated buffer
-    size_t buf_size; // size in bytes
-    COORD cursor_pos;
-    COORD line_input_saved_cursor;
-    COORD size;
-    uint32_t scrollback_available; // number of lines of current width "above" buffer that are available. can wrap to the bottom ((char*)buffer_start + buf_size)
-    uint32_t scrollback; // in lines, above current view, shouldn't be higher than scrollbac_available
-    vt_parse_state vt_state; // tracks vt state, when enabled
-} TermOutputBuffer;
 
 TermOutputBuffer frontbuffer = { 0 };
 TermOutputBuffer relayoutbuffer = { 0 };
 
-static const CharAttributes default_attrs = { 0xffffff, 0, false, false };
+static const CharAttributes default_attrs = {
+    0,        // bold
+    0,        // soft_wrap
+    0,        // copmlex
+    0,        // wrappoint
+    0,        // pad0
+    0xffffff, //color
+    0         // backg
+};
 CharAttributes current_attrs = default_attrs;
 
 INPUT_RECORD pending_events[256];
@@ -133,14 +120,53 @@ uint32_t min(uint32_t a, uint32_t b) {
 uint32_t max(uint32_t a, uint32_t b) {
     return a > b ? a : b;
 }
+#ifdef _M_X64
 size_t min(size_t a, size_t b) {
     return a < b ? a : b;
 }
 size_t max(size_t a, size_t b) {
     return a > b ? a : b;
 }
+#endif
 
 #define DEFAULT_VT_BUFFER_SIZE 64
+
+ComplexChar* alloc_complex_ch(TermOutputBuffer* tb, wchar_t* run, size_t len, glyph_hash tile_hash, glyph_dim dim) {
+    ComplexChar* res = nullptr;
+    if (tb->complex_ch_freelist) {
+        res = tb->complex_ch_freelist;
+        tb->complex_ch_freelist = tb->complex_ch_freelist->next_free;
+    } else {
+        // todo: maybe switch to arena
+        res = (ComplexChar*)malloc(sizeof(ComplexChar));
+    }
+    res->start = (wchar_t*)malloc(len * 2);
+    res->len = len;
+    memcpy(res->start, run, res->len * 2);
+    res->hash = tile_hash;
+    res->dim = dim;
+    return res;
+}
+
+void free_complex_ch(TermOutputBuffer* tb, ComplexChar* c) {
+    // todo: we probably can reuse these too
+    free(c->start);
+    // todo: maybe have a limit on freelist size
+    c->next_free = tb->complex_ch_freelist;
+    tb->complex_ch_freelist = c;
+}
+
+void clear_buffer_cells(TermOutputBuffer* tb, TermChar* start, size_t count) {
+    TermChar* current = start;
+    for(size_t i = 0; i < count; ++i) {
+        if (current->attr.complex && current->complex_ch) {
+            free_complex_ch(tb, current->complex_ch);
+        }
+        // todo: see if it's faster to process all and then ZeroMemory instead of this
+        *current = { 0 };
+        ++current;
+    }
+}
 
 bool initialize_term_output_buffer(TermOutputBuffer& tb, COORD size, bool zeromem) {
     size_t requested_size = size.X * (size.Y + default_scrollback) * sizeof(tb.buffer[0]);
@@ -215,12 +241,14 @@ void scroll_down(TermOutputBuffer& tb, UINT lines) {
     tb.buffer = check_wrap_backwards(&tb, tb.buffer - tb.size.X * lines);
     TermChar* zeroing_start = tb.buffer;
     TermChar* zeroing_end = check_wrap(&tb, zeroing_start + tb.size.X * lines);
+
     // if no wrap
     if (zeroing_end >= zeroing_start) {
         ZeroMemory(zeroing_start, (char*)zeroing_end - (char*)zeroing_start);
+        clear_buffer_cells(&tb, zeroing_start, zeroing_end - zeroing_start);
     } else {
-        ZeroMemory(zeroing_start, (char*)get_wrap_ptr(&tb) - (char*)zeroing_start);
-        ZeroMemory(tb.buffer_start, (char*)zeroing_end - (char*)tb.buffer_start);
+        clear_buffer_cells(&tb, zeroing_start, get_wrap_ptr(&tb) - zeroing_start);
+        clear_buffer_cells(&tb, tb.buffer_start, zeroing_end - tb.buffer_start);
     }
 }
 
@@ -238,11 +266,32 @@ void scroll_up(TermOutputBuffer& tb, UINT lines) {
     TermChar* screen_end = check_wrap(&tb, tb.buffer + tb.size.X * tb.size.Y);
     // if no wrap
     if (screen_end >= zeroing_start) {
-        ZeroMemory(zeroing_start, (char*)screen_end - (char*)zeroing_start);
+        clear_buffer_cells(&tb, zeroing_start, screen_end - zeroing_start);
     } else {
-        ZeroMemory(zeroing_start, (char*)get_wrap_ptr(&tb) - (char*)zeroing_start);
-        ZeroMemory(tb.buffer_start, (char*)screen_end - (char*)tb.buffer_start);
+        clear_buffer_cells(&tb, zeroing_start, get_wrap_ptr(&tb) - zeroing_start);
+        clear_buffer_cells(&tb, tb.buffer_start, screen_end - tb.buffer_start);
     }
+}
+
+void swap_buffers(TermOutputBuffer* front, TermOutputBuffer* layout) {
+    // TODO: get rid of this, separate rendering data from TermOutputBuffer and swap by value
+    TermChar* temp_tc = front->buffer;
+    front->buffer = layout->buffer;
+    layout->buffer = temp_tc;
+    temp_tc = front->buffer_start;
+    front->buffer_start = layout->buffer_start;
+    layout->buffer_start = temp_tc;
+    ComplexChar* temp_cc = front->complex_ch_freelist;
+    front->complex_ch_freelist = layout->complex_ch_freelist;
+    layout->complex_ch_freelist = temp_cc;
+    size_t temp_size = front->buf_size;
+    front->buf_size = layout->buf_size;
+    layout->buf_size = temp_size;
+    front->cursor_pos = layout->cursor_pos;
+    front->line_input_saved_cursor = layout->line_input_saved_cursor;
+    front->size = layout->size;
+    front->scrollback_available = layout->scrollback_available;
+    front->scrollback = layout->scrollback;
 }
 
 void FastFast_Resize(SHORT width, SHORT height) {
@@ -268,6 +317,7 @@ void FastFast_Resize(SHORT width, SHORT height) {
     TermChar* frontbuffer_wrap = get_wrap_ptr(&frontbuffer);
     TermChar* old_t = check_wrap_backwards(&frontbuffer, frontbuffer.buffer - frontbuffer.size.X * frontbuffer.scrollback_available);
     bool first = true;
+    TermChar* prev_write_char = 0;
     for (int y = -(int)frontbuffer.scrollback_available; y < frontbuffer.size.Y; ++y) {
         // at each line that's not first, if last char on previous row doesn't have soft_wrap attribute set, we issue a new line
         if (!first) {
@@ -280,7 +330,9 @@ void FastFast_Resize(SHORT width, SHORT height) {
                 // and those we should leave alone at relayout. So solution here is to count empty lines
                 // until we hit non-empty one. Trailing empty lines are ignored
                 ++empty_lines;
+                prev_write_char = 0;
             } else if(!last_ch_from_prev_row || !last_ch_from_prev_row->attr.soft_wrap) {
+                prev_write_char = 0;
                 cursor_pos.X = 0;
                 cursor_pos.Y += empty_lines + 1;
                 empty_lines = 0;
@@ -291,8 +343,7 @@ void FastFast_Resize(SHORT width, SHORT height) {
         } else {
             first = false;
         }
-        last_ch_from_prev_row = 0;
-        for (int x = 0; x < frontbuffer.size.X; ++x) {
+        for (int x = 0; x < frontbuffer.size.X; /* x is advanced at the bottom of loop */) {
             if (!line_input_cursor_found && x == frontbuffer.line_input_saved_cursor.X && y == frontbuffer.line_input_saved_cursor.Y) {
                 relayoutbuffer.line_input_saved_cursor = cursor_pos;
                 line_input_cursor_found = true;
@@ -301,7 +352,6 @@ void FastFast_Resize(SHORT width, SHORT height) {
                 mapped_cursor_pos = cursor_pos;
                 cursor_found = true;
             }
-            TermChar* t = check_wrap(&relayoutbuffer, relayoutbuffer.buffer + cursor_pos.Y * size.X + cursor_pos.X);
             if (!old_t->ch) {
                 old_t += frontbuffer.size.X - x;
                 // end of line
@@ -309,35 +359,41 @@ void FastFast_Resize(SHORT width, SHORT height) {
             }
             last_ch_from_prev_row = old_t;
 
-            if (cursor_pos.X == size.X)
-            {
-                TermChar* prev_char = check_wrap_backwards(&relayoutbuffer, t - 1);
-                // todo: do we really need this check? if we ended-up here, that we _should_ have had previous char
-                if (prev_char->ch) {
-                    prev_char->attr.soft_wrap = true;
+            size_t advance = old_t->attr.complex ? old_t->complex_ch->dim.TileCount : 1;
+            
+            // todo: implement hardbreak if this is true
+            Assert(advance < size.X); 
+
+            if (advance > size.X - cursor_pos.X) {
+                if (prev_write_char) {
+                    prev_write_char->attr.soft_wrap = true;
                 }
                 cursor_pos.X = 0;
                 cursor_pos.Y++;
-                // we don't need to update t, as it already points to the right one
             }
+
             if (cursor_pos.Y >= size.Y) {
                 scroll_up(relayoutbuffer, cursor_pos.Y - size.Y + 1);
-                t = check_wrap(&relayoutbuffer, relayoutbuffer.buffer + cursor_pos.Y * size.X + cursor_pos.X);
             }
-            *t = *old_t;
-            t->attr.soft_wrap = false;
-            cursor_pos.X++;
+            TermChar* t = check_wrap(&relayoutbuffer, relayoutbuffer.buffer + cursor_pos.Y * size.X + cursor_pos.X);
+            prev_write_char = t;
 
-            old_t++;
+            for (size_t i = 0; i < advance; ++i) {
+                *t = *old_t;
+                t->attr.soft_wrap = false;
+                ++t;
+                ++old_t;
+            }
+            
+            cursor_pos.X += advance;
+            x += advance;
         }
     }
     // should be always true
     Assert(line_input_cursor_found);
     Assert(cursor_found);
     cursor_pos = mapped_cursor_pos;
-    TermOutputBuffer temp = frontbuffer;
-    frontbuffer = relayoutbuffer;
-    relayoutbuffer = temp;
+    swap_buffers(&frontbuffer, &relayoutbuffer);
 
     INPUT_RECORD resize_event = {};
     resize_event.EventType = WINDOW_BUFFER_SIZE_EVENT;
@@ -369,6 +425,13 @@ static int num(const char*& str, int def = 0)
         ++it;
     }
     return (it && r) ? r : def;
+}
+
+static int IsDirectCodepoint(wchar_t CodePoint)
+{
+    int Result = ((CodePoint >= MinDirectCodepoint) &&
+        (CodePoint <= MaxDirectCodepoint));
+    return Result;
 }
 
 // TODO TODO: can this be deduped please?
@@ -718,23 +781,254 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
         } 
         else if (action == Print)
         {
+            Assert(c);
             if (cursor_pos.Y >= size.Y) {
                 scroll_up(tb, cursor_pos.Y - size.Y + 1);
             }
             if (cursor_pos.X >= 0 && cursor_pos.X < size.X && cursor_pos.Y >= 0 && cursor_pos.Y < size.Y)
             {
                 TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
-                t->ch = c;
-                t->attr = current_attrs;
 
-                cursor_pos.X++;
-                if (cursor_pos.X == size.X)
-                {
-                    // todo: only do that if WRAP_AT_EOL_OUTPUT is enabled
-                    cursor_pos.X = 0;
-                    cursor_pos.Y++;
-                    t->attr.soft_wrap = true;
+                // go backward to find last wrappoint, so that we can relayout rest with uniscribe
+
+                // todo: this can be done faster for common-case of just streaming data, 
+                // current version supports "worst case" where cursor jumps arbitrarily, 
+                // overwriting existing data and invalidating existing layout.
+                // In case of streaming and unicode parser that's state machine,
+                // no backtracking should be needed
+                TermChar* run_t = t;
+                COORD run_pos = cursor_pos;
+                while (true) {
+                    if (!run_pos.X) {
+                        TermChar* candidate_t;
+                        if (run_pos.Y <= -((int)tb.scrollback_available)) {
+                            break;
+                        }
+                        if (run_t == tb.buffer_start) {
+                            candidate_t = (TermChar*)((char*)tb.buffer_start + tb.buf_size) - 1;
+                        } else {
+                            candidate_t = run_t - 1;
+                        }
+                        if (!candidate_t->attr.soft_wrap) {
+                            break;
+                        }
+                        --run_pos.Y;
+                        run_pos.X = size.X - 1;
+                        run_t = candidate_t;
+                        if (run_t->attr.wrappoint) {
+                            break;
+                        }
+                    } else {
+                        run_t = run_t - 1;
+                        --run_pos.X;
+                        if (run_t->attr.wrappoint) {
+                            break;
+                        }
+                    }
                 }
+                // run_t now has first char that we should consider, we have to rebuild string to send to uniscribe
+                // run_t can be same as t
+
+                example_partitioner* Partitioner = &tb.Partitioner;
+                wchar_t* layout_buf = Partitioner->Expansion;
+                // todo: should be growable
+                size_t layout_buf_size = ArrayCount(Partitioner->Expansion);
+                size_t layout_idx = 0;
+                TermChar* collect_t = run_t;
+                while (collect_t != t && layout_idx < layout_buf_size) {
+                    if (!collect_t->attr.complex) {
+                        layout_buf[layout_idx++] = collect_t->ch;
+                    } else if (collect_t->complex_ch) {
+                        for (size_t i = 0; i < collect_t->complex_ch->len; ++i) {
+                            if (layout_idx >= layout_buf_size) {
+                                break;
+                            }
+                            layout_buf[layout_idx++] = *(collect_t->complex_ch->start + i);
+                        }
+                    }
+                    collect_t = check_wrap(&tb, collect_t + 1);
+                }
+                // if we overflowed, nothing is gonna work...
+                Assert(layout_idx + 1 < layout_buf_size);
+                layout_buf[layout_idx++] = c;
+
+                DWORD Count = layout_idx;
+                // now we have collected string, do layout, overwrite from run_t
+                int ItemCount = 0;
+                ScriptItemize(layout_buf, Count, ArrayCount(Partitioner->Items), &Partitioner->UniControl, &Partitioner->UniState, Partitioner->Items, &ItemCount);
+
+                int Segment = 0;
+
+                for (int ItemIndex = 0;
+                    ItemIndex < ItemCount;
+                    ++ItemIndex)
+                {
+                    SCRIPT_ITEM* Item = Partitioner->Items + ItemIndex;
+
+                    Assert((DWORD)Item->iCharPos < Count);
+                    DWORD StrCount = Count - Item->iCharPos;
+                    if ((ItemIndex + 1) < ItemCount)
+                    {
+                        Assert(Item[1].iCharPos >= Item[0].iCharPos);
+                        StrCount = (Item[1].iCharPos - Item[0].iCharPos);
+                    }
+
+                    wchar_t* Str = layout_buf + Item->iCharPos;
+
+                    int IsComplex = (ScriptIsComplex(Str, StrCount, SIC_COMPLEX) == S_OK);
+                    ScriptBreak(Str, StrCount, &Item->a, Partitioner->Log);
+
+                    int SegCount = 0;
+
+                    Partitioner->SegP[SegCount++] = 0;
+                    for (uint32_t CheckIndex = 0;
+                        CheckIndex < StrCount;
+                        ++CheckIndex)
+                    {
+                        SCRIPT_LOGATTR Attr = Partitioner->Log[CheckIndex];
+                        int ShouldBreak = (Str[CheckIndex] == ' ');;
+                        if (IsComplex)
+                        {
+                            ShouldBreak |= Attr.fSoftBreak;
+                        } else
+                        {
+                            ShouldBreak |= Attr.fCharStop;
+                        }
+
+                        if (ShouldBreak) Partitioner->SegP[SegCount++] = CheckIndex;
+                    }
+                    Partitioner->SegP[SegCount++] = StrCount;
+
+                    int dSeg = 1;
+                    int SegStart = 0;
+                    int SegStop = SegCount - 1;
+                    if (Item->a.fRTL || Item->a.fLayoutRTL)
+                    {
+                        dSeg = -1;
+                        SegStart = SegCount - 2;
+                        SegStop = -1;
+                    }
+
+                    for (int SegIndex = SegStart;
+                        SegIndex != SegStop;
+                        SegIndex += dSeg)
+                    {
+                        size_t Start = Partitioner->SegP[SegIndex];
+                        size_t End = Partitioner->SegP[SegIndex + 1];
+                        size_t ThisCount = (End - Start);
+
+                        bool is_last = SegIndex == SegStop;
+
+                        // todo: should we check for scroll somewhere here?
+                        if (ThisCount)
+                        {
+                            wchar_t* Run = Str + Start;
+                            wchar_t CodePoint = Run[0];
+                            // todo: we can save some storage if complex char takes one wchar_t only
+                            if ((ThisCount == 1) && IsDirectCodepoint(CodePoint))
+                            {
+                                if (run_pos.Y >= size.Y) {
+                                    uint32_t lines = run_pos.Y - size.Y + 1;
+                                    scroll_up(tb, lines);
+                                    // run_pos is a copy, so we have to update ourselves
+                                    run_pos.Y -= lines;
+                                }
+                                if (run_t->attr.complex && run_t->complex_ch) {
+                                    free_complex_ch(&tb, run_t->complex_ch);
+                                }
+                                run_t->attr = current_attrs;
+                                run_t->ch = CodePoint;
+
+                                run_t->attr.wrappoint = true;
+                                run_pos.X++;
+                                if (run_pos.X == size.X)
+                                {
+                                    // todo: only do that if WRAP_AT_EOL_OUTPUT is enabled
+                                    run_pos.X = 0;
+                                    run_pos.Y++;
+                                    run_t->attr.soft_wrap = true;
+                                }
+
+                                run_t = check_wrap(&tb, run_t + 1);
+                            } else
+                            {
+                                // TODO(casey): This wastes a lookup on the tile count.
+                                // It should save the entry somehow, and roll it into the first cell.
+
+                                glyph_hash RunHash = ComputeGlyphHash(2 * ThisCount, (char unsigned*)Run, DefaultSeed);
+                                glyph_dim GlyphDim = GetGlyphDim(&tb.GlyphGen, tb.GlyphTable, ThisCount, Run, RunHash);
+                                
+                                Assert(GlyphDim.TileCount);
+
+                                if (run_pos.X + GlyphDim.TileCount >= size.X && GlyphDim.TileCount < size.X) {
+                                    // we are soft wrapping this glyph to new line,
+                                    // clear till end of buffer, set softwrap on previous run_t
+                                    // it should exist since we know we can fit whole glyph in at least full line
+                                    // so since we can't, there are some other chars on current line
+                                    (run_t - 1)->attr.soft_wrap = true;
+                                    size_t cells_to_skip = size.X - run_pos.X;
+                                    clear_buffer_cells(&tb, run_t, cells_to_skip);
+                                    run_t += cells_to_skip;
+                                    run_pos.X = 0;
+                                    run_pos.Y++;
+                                } else if (GlyphDim.TileCount >= size.X) {
+                                    // we can't fit this glyph even in a full line, do some hard break?
+                                    Assert(!"Hard breaks not supported yet");
+                                }
+                                if (run_pos.Y >= size.Y) {
+                                    uint32_t lines = run_pos.Y - size.Y + 1;
+                                    scroll_up(tb, lines);
+                                    // run_pos is a copy, so we have to update ourselves
+                                    run_pos.Y -= lines;
+                                }
+
+                                if (run_t->attr.complex && run_t->complex_ch) {
+                                    free_complex_ch(&tb, run_t->complex_ch);
+                                }
+                                run_t->complex_ch = alloc_complex_ch(&tb, Run, ThisCount, RunHash, GlyphDim);
+                                run_t->attr = current_attrs;
+                                run_t->attr.wrappoint = true;
+                                run_t->attr.complex = true;
+
+                                run_pos.X++;
+                                // todo: this should only be done for hard-break case
+                                if (run_pos.X == size.X)
+                                {
+                                    // todo: only do that if WRAP_AT_EOL_OUTPUT is enabled
+                                    run_pos.X = 0;
+                                    run_pos.Y++;
+                                    run_t->attr.soft_wrap = true;
+                                }
+                                run_t = check_wrap(&tb, run_t + 1);
+
+                                for (uint32_t TileIndex = 1;
+                                    TileIndex < GlyphDim.TileCount;
+                                    ++TileIndex)
+                                {
+                                    if (run_t->attr.complex && run_t->complex_ch) {
+                                        free_complex_ch(&tb, run_t->complex_ch);
+                                    }
+                                    run_t->complex_ch = 0; // this is continuation char
+                                    run_t->attr = current_attrs;
+                                    run_t->attr.complex = true;
+
+                                    run_pos.X++;
+                                    // todo: this should only be done for hard-break case
+                                    if (run_pos.X == size.X)
+                                    {
+                                        // todo: only do that if WRAP_AT_EOL_OUTPUT is enabled
+                                        run_pos.X = 0;
+                                        run_pos.Y++;
+                                        run_t->attr.soft_wrap = true;
+                                    }
+
+                                    run_t = check_wrap(&tb, run_t + 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                cursor_pos = run_pos;
             }
         }
     }
@@ -742,372 +1036,13 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
 
 void FastFast_UpdateTerminalA(TermOutputBuffer& tb, const char* str, SIZE_T count)
 {
-    COORD& cursor_pos = tb.cursor_pos;
-    COORD& size = tb.size;
-    bool vt_processing_enabled = output_console_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    int i = 0;
-    while (count != 0)
-    {
-        ++i;        
-        vt_action action = Ignore;
-        char c = *str;
-        if (vt_processing_enabled)
-        {
-            action = vt_process_char_a(&tb.vt_state, str, count == 1);
-            str++;
-            count--;
-
-            switch (action) {
-            case CsiDispatch: {
-                const char* param_start = (const char*)tb.vt_state.params_start;
-                const char* immediate_start = (const char*)tb.vt_state.intermediate_start;
-                const char* end = (const char*)tb.vt_state.end;
-                switch (*end) {
-                case 'A':
-                case 'F': {
-                    const char* s = param_start;
-                    int lines = num(s, 1);
-                    cursor_pos.Y -= min(cursor_pos.Y, lines);
-                    if (*end == 'F') {
-                        cursor_pos.X = 0;
-                    }
-                    break;
-                }
-                case 'B':
-                case 'E': {
-                    const char* s = param_start;
-                    int lines = num(s, 1);
-                    cursor_pos.Y = min(tb.size.Y - 1, cursor_pos.Y + lines);
-                    if (*end == 'E') {
-                        cursor_pos.X = 0;
-                    }
-                    break;
-                }
-                case 'C': {
-                    const char* s = param_start;
-                    int chars = num(s, 1);
-                    cursor_pos.X = min(tb.size.X - 1, cursor_pos.X + chars);
-                    break;
-                }
-                case 'D': {
-                    const char* s = param_start;
-                    int chars = num(s, 1);
-                    cursor_pos.X -= min(cursor_pos.X, chars);
-                    break;
-                }
-                case 'G': {
-                    const char* s = param_start;
-                    int pos = num(s, 1) - 1;
-                    cursor_pos.X = max(0, min(tb.size.X - 1, pos));
-                    break;
-                }
-                case 'd': {
-                    const char* s = param_start;
-                    int pos = num(s, 1) - 1;
-                    cursor_pos.Y = max(0, min(tb.size.Y - 1, pos));
-                    break;
-                }
-                case 'H':
-                case 'f': {
-                    const char* s = param_start;
-                    cursor_pos.Y = min(tb.size.Y - 1, num(s, 1) - 1);
-                    s++;
-                    cursor_pos.X = min(tb.size.X - 1, num(s, 1) - 1);
-                    break;
-                }
-                case 'J':
-                case 'K': {
-                    const char* s = param_start;
-                    int erase_mode = num(s);
-                    bool screen = *end == 'J';
-                    COORD start, end;
-                    switch (erase_mode) {
-                    case 0:
-                        start = tb.cursor_pos;
-                        end.X = tb.size.X - 1;
-                        end.Y = screen ? tb.size.Y - 1 : start.Y;
-                        break;
-                    case 1:
-                        start.X = 0;
-                        start.Y = screen ? 0 : start.Y;
-                        end = tb.cursor_pos;
-                        break;
-                    case 2:
-                        start.X = 0;
-                        start.Y = screen ? 0 : start.Y;
-                        end.X = tb.size.X - 1;
-                        end.Y = screen ? tb.size.Y - 1 : start.Y;
-                        break;
-                    default:
-                        debug_printf(L"Unknown erase mode %d", erase_mode);
-                        break;
-                    }
-                    // todo: dedup this ugly wrapping code
-                    TermChar* t = check_wrap(&tb, tb.buffer + tb.size.X * start.Y + start.X);
-                    TermChar* end_t = check_wrap(&tb, tb.buffer + tb.size.X * end.Y + end.X);
-                    if (end_t >= t) {
-                        while (t != end_t) {
-                            t->attr = default_attrs;
-                            t->ch = L' ';
-                            ++t;
-                        }
-                    } else {
-                        TermChar* wrap = get_wrap_ptr(&tb);
-                        while (t != wrap) {
-                            t->attr = default_attrs;
-                            t->ch = L' ';
-                            ++t;
-                        }
-                        t = tb.buffer_start;
-                        while (t != end_t) {
-                            t->attr = default_attrs;
-                            t->ch = L' ';
-                            ++t;
-                        }
-                    }
-                    break;
-                }
-                case 'm': {
-                    const char* s = param_start;
-                    int rendition = num(s);
-                    s++;
-                    switch (rendition) {
-                    case 0:
-                        current_attrs = default_attrs;
-                        break;
-                    case 1:
-                    case 22:
-                        current_attrs.bold = rendition == 1;
-                        break;
-                    case 7:
-                    case 27: {
-                        // todo: check that 27 without preceding 7 is handled correctly
-                        int temp = current_attrs.color;
-                        current_attrs.color = current_attrs.backg;
-                        current_attrs.backg = temp;
-                        break;
-                    }
-                           // programming languages are great!
-                    case 30:
-                    case 31:
-                    case 32:
-                    case 33:
-                    case 34:
-                    case 35:
-                    case 36:
-                    case 37:
-                    case 40:
-                    case 41:
-                    case 42:
-                    case 43:
-                    case 44:
-                    case 45:
-                    case 46:
-                    case 47:
-                    case 90:
-                    case 91:
-                    case 92:
-                    case 93:
-                    case 94:
-                    case 95:
-                    case 96:
-                    case 97:
-                    case 100:
-                    case 101:
-                    case 102:
-                    case 103:
-                    case 104:
-                    case 105:
-                    case 106:
-                    case 107:
-                    {
-                        BOOL fg = rendition < 40 || rendition >= 90 && rendition < 100;
-                        int idx = rendition - (fg ? 30 : 40);
-                        if (idx > 7) {
-                            idx -= 60;
-                        }
-                        int color = default_colors[idx & 0xff];
-                        if (fg) {
-                            current_attrs.color = color;
-                        } else {
-                            current_attrs.backg = color;
-                        }
-                        break;
-                    }
-                    case 38:
-                    case 48: {
-                        BOOL fg = rendition == 38;
-                        int mode = num(s);
-                        s++;
-                        if (mode != 2 && mode != 5) {
-                            debug_printf(L"Unsupported color request type: %d\n", mode);
-                            break;
-                        }
-                        int color;
-                        if (mode == 2) {
-                            int r = num(s);
-                            s++;
-                            int g = num(s);
-                            s++;
-                            int b = num(s);
-                            color = r | (g << 8) | (b << 16);
-                        } else {
-                            int idx = num(s);
-                            if (idx < 16) {
-                                color = default_colors[idx];
-                            } else {
-                                debug_printf(L"Color indicies larger than 15 are not supported\n");
-                                break;
-                            }
-                        }
-
-                        if (fg) {
-                            current_attrs.color = color;
-                        } else {
-                            current_attrs.backg = color;
-                        }
-                        break;
-                    }
-                    case 39: {
-                        current_attrs.color = default_attrs.color;
-                        current_attrs.bold = default_attrs.bold;
-                        break;
-                    }
-                    case 49: {
-                        current_attrs.backg = default_attrs.backg;
-                        break;
-                    }
-                    default:
-                        debug_printf(L"Unsupported rendition requested: %d\n", rendition);
-                        break;
-                    }
-                    break;
-                }
-                case 'S':
-                case 'T': {
-                    const char* s = param_start;
-                    int lines = num(s, 1);
-                    s++;
-                    if (*end == 'T') {
-                        scroll_down(tb, lines);
-                    } else {
-                        scroll_up(tb, lines);
-                    }
-                    break;
-                }
-                default: {
-                    debug_printf_a("Unknown VT request %.*s\n", end - param_start + 1, param_start);
-                    break;
-                }
-                }
-                break;
-            }
-            case OscDispatch: {
-                const char* param_start = (const char*)tb.vt_state.params_start;
-                const char* immediate_start = (const char*)tb.vt_state.intermediate_start;
-                const char* end = (const char*)tb.vt_state.end;
-                debug_printf_a("Unknown OSC request %.*s\n", end - param_start + 1, param_start);
-                break;
-            }
-            case EscDispatch: {
-                const wchar_t* param_start = (const wchar_t*)tb.vt_state.params_start;
-                const wchar_t* end = (const wchar_t*)tb.vt_state.end;
-                debug_printf_a("Unknown ESC request %.*s\n", end - param_start + 1, param_start);
-                break;
-            }
-            case DcsDispatch: {
-                const wchar_t* param_start = (const wchar_t*)tb.vt_state.params_start;
-                const wchar_t* end = (const wchar_t*)tb.vt_state.end;
-                debug_printf_a("Unknown DCS request %.*s\n", end - param_start + 1, param_start);
-                break;
-            }
-            }
-        } else {
-            action = is_cmd_char_a(*str) ? Execute : Print;
-            ++str;
-            --count;
-        }
-        if (action == Execute) {
-            switch (c) {
-                // backspace
-            case '\b': {
-                bool overwrite = true;
-                COORD backup_limit = { 0, 0 };
-                // todo: this should only be done for echoed input characters, not any backspace that app writes
-                if (input_console_mode & ENABLE_LINE_INPUT) {
-                    backup_limit = tb.line_input_saved_cursor;
-                }
-
-                if (!cursor_pos.X) {
-                    if (cursor_pos.Y > backup_limit.Y) {
-                        --cursor_pos.Y;
-                        cursor_pos.X = size.X - 1;
-                    } else {
-                        // nowhere to backup
-                        overwrite = false;
-                    }
-                } else {
-                    if (cursor_pos.Y > backup_limit.Y || cursor_pos.X > backup_limit.X) {
-                        cursor_pos.X--;
-                    } else {
-                        // nowhere to backup
-                        overwrite = false;
-                    }
-                }
-                if (overwrite) {
-                    TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
-                    t->ch = ' ';
-                    t->attr = current_attrs;
-                }
-                break;
-            }
-            case '\r': {
-                cursor_pos.X = 0;
-                break;
-            }
-            case '\n': {
-                cursor_pos.X = 0;
-                cursor_pos.Y++;
-                if (cursor_pos.Y >= size.Y) {
-                    scroll_up(tb, cursor_pos.Y - size.Y + 1);
-                }
-                // write space without advancing just to mark this line as "used"
-                TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
-                if (!t->ch) {
-                    t->ch = L' ';
-                    t->attr = current_attrs;
-                }
-                break;
-            }
-            case '\a': {
-                // bell
-                PlaySoundW((LPCWSTR)SND_ALIAS_SYSTEMHAND, nullptr, SND_ALIAS_ID | SND_ASYNC | SND_SENTRY);
-                break;
-            }
-            }
-        } 
-        else if (action == Print)
-        {
-            if (cursor_pos.Y >= size.Y) {
-                scroll_up(tb, cursor_pos.Y - size.Y + 1);
-            }
-            if (cursor_pos.X >= 0 && cursor_pos.X < size.X && cursor_pos.Y >= 0 && cursor_pos.Y < size.Y)
-            {
-                TermChar* t = check_wrap(&tb, tb.buffer + cursor_pos.Y * size.X + cursor_pos.X);
-                t->ch = c;
-                t->attr = current_attrs;
-
-                cursor_pos.X++;
-                if (cursor_pos.X == size.X)
-                {
-                    // todo: only do that if WRAP_AT_EOL_OUTPUT is enabled
-                    cursor_pos.X = 0;
-                    cursor_pos.Y++;
-                    t->attr.soft_wrap = true;
-                }
-            }
-        }
+    wchar_t* temp_buf = (wchar_t*)malloc(sizeof(wchar_t) * count);
+    DWORD chars = MultiByteToWideChar(output_cp, 0, str, count, temp_buf, count);
+    if (!chars) {
+        Assert(false);
     }
+    FastFast_UpdateTerminalW(tb, temp_buf, chars);
+    free(temp_buf);
 }
 
 const size_t DEFAULT_BUF_SIZE = 128;
@@ -1403,6 +1338,7 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                             frontbuffer.line_input_saved_cursor = { 0, 0 };
                         }
                         FastFast_UnlockTerminal();
+                        SetEvent(buffer_update_event);
                     }
 
                     if (!has_cr) {
@@ -1589,6 +1525,7 @@ HRESULT HandleWriteMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_compl
         FastFast_UpdateTerminalA(frontbuffer, output_buf, bytes);
     }
     FastFast_UnlockTerminal();
+    SetEvent(buffer_update_event);
 
     io_complete->IoStatus.Information = write_msg->NumBytes = bytes;
     return STATUS_SUCCESS;
@@ -2161,6 +2098,7 @@ static LRESULT CALLBACK WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lPa
             }
             }
             FastFast_UnlockTerminal();
+            SetEvent(buffer_update_event);
             return 0;
         }
     case WM_KEYDOWN:
@@ -2212,7 +2150,12 @@ static LRESULT CALLBACK WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lPa
             SetEvent(delayed_io_event);
             return 0;
         }
+    case WM_SIZE:
+        {
+            SetEvent(buffer_update_event);
+        }
     }
+
     return DefWindowProcW(wnd, msg, wParam, lParam);
 }
 
@@ -2349,7 +2292,7 @@ DWORD WINAPI WindowThread(LPVOID lpParameter) {
     DWORD exstyle = WS_EX_APPWINDOW;
     DWORD style = WS_OVERLAPPEDWINDOW | WS_VSCROLL;
 
-    window = CreateWindowExW(exstyle, wc.lpszClassName, L"Handterm", style, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, wc.hInstance, NULL);
+    window = CreateWindowExW(exstyle, wc.lpszClassName, L"Handterm", style, CW_USEDEFAULT, CW_USEDEFAULT, 640, 640, NULL, NULL, wc.hInstance, NULL);
     Assert(window);
     // show the window
     ShowWindow(window, SW_SHOWDEFAULT);
@@ -2378,6 +2321,93 @@ DWORD WINAPI WindowThread(LPVOID lpParameter) {
     return 0;
 }
 
+static void
+RevertToDefaultFont(TermOutputBuffer* Terminal)
+{
+#if 0
+    wsprintfW(Terminal->RequestedFontName, L"%s", L"Courier New");
+    Terminal->RequestedFontHeight = 25;
+#else
+    wsprintfW(Terminal->RequestedFontName, L"%s", L"Cascadia Mono");
+    Terminal->RequestedFontHeight = 17;
+#endif
+}
+
+static int
+RefreshFont(TermOutputBuffer* Terminal)
+{
+    int Result = 0;
+
+    //
+    // NOTE(casey): Set up the mapping table between run-hashes and glyphs
+    //
+
+    glyph_table_params Params = { 0 };
+
+    // NOTE(casey): An additional tile is reserved for position 0, so it can be "empty",
+    // in case the space glyph is not actually empty.
+    Params.ReservedTileCount = ArrayCount(Terminal->ReservedTileTable) + 1;
+
+    // NOTE(casey): We have to shrink the font size until it fits in the glyph texture,
+    // to prevent large fonts from overflowing.
+    for (int Try = 0; Try <= 1; ++Try)
+    {
+        Result = SetFont(&Terminal->GlyphGen, Terminal->RequestedFontName, Terminal->RequestedFontHeight);
+        if (Result)
+        {
+            Params.CacheTileCountInX = SafeRatio1(Terminal->REFTERM_TEXTURE_WIDTH, Terminal->GlyphGen.FontWidth);
+            Params.EntryCount = GetExpectedTileCountForDimension(&Terminal->GlyphGen, Terminal->REFTERM_TEXTURE_WIDTH, Terminal->REFTERM_TEXTURE_HEIGHT);
+            Params.HashCount = 4096;
+
+            if (Params.EntryCount > Params.ReservedTileCount)
+            {
+                Params.EntryCount -= Params.ReservedTileCount;
+                break;
+            }
+        }
+
+        RevertToDefaultFont(Terminal);
+    }
+
+    // TODO(casey): In theory, this VirtualAlloc could fail, so it may be a better idea to
+    // just use a reserved memory footprint here and always use the same size.  It is not
+    // a very large amount of memory, so picking a maximum and sticking with it is probably
+    // better.  You can cap the size of the cache and there is no real penalty for doing
+    // that, since it's a cache, so it'd just be a better idea all around.
+    if (Terminal->GlyphTableMem)
+    {
+        VirtualFree(Terminal->GlyphTableMem, 0, MEM_RELEASE);
+        Terminal->GlyphTableMem = 0;
+    }
+    Terminal->GlyphTableMem = VirtualAlloc(0, GetGlyphTableFootprint(Params), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    Terminal->GlyphTable = PlaceGlyphTableInMemory(Params, Terminal->GlyphTableMem);
+
+    InitializeDirectGlyphTable(Params, Terminal->ReservedTileTable, 1);
+
+    //
+    // NOTE(casey): Pre-rasterize all the ASCII characters, since they are directly mapped rather than hash-mapped.
+    //
+
+    glyph_dim UnitDim = GetSingleTileUnitDim();
+
+    for (uint32_t TileIndex = 0;
+        TileIndex < ArrayCount(Terminal->ReservedTileTable);
+        ++TileIndex)
+    {
+        wchar_t Letter = MinDirectCodepoint + TileIndex;
+        PrepareTilesForTransfer(&Terminal->GlyphGen, &Terminal->Renderer, 1, &Letter, UnitDim);
+        TransferTile(&Terminal->GlyphGen, &Terminal->Renderer, 0, Terminal->ReservedTileTable[TileIndex]);
+    }
+
+    // NOTE(casey): Clear the reserved 0 tile
+    wchar_t Nothing = 0;
+    gpu_glyph_index ZeroTile = { 0 };
+    PrepareTilesForTransfer(&Terminal->GlyphGen, &Terminal->Renderer, 0, &Nothing, UnitDim);
+    TransferTile(&Terminal->GlyphGen, &Terminal->Renderer, 0, ZeroTile);
+
+    return Result;
+}
+
 int WINAPI WinMain(
     _In_ HINSTANCE hInstance,
     _In_opt_ HINSTANCE hPrevInstance,
@@ -2388,248 +2418,10 @@ int WINAPI WinMain(
     HRESULT hr;
 
     window_ready_event = CreateEventExW(0, 0, 0, EVENT_ALL_ACCESS);
+    buffer_update_event = CreateEventExW(0, 0, 0, EVENT_ALL_ACCESS);
     CreateThread(0, 0, WindowThread, 0, 0, 0);
     WaitForSingleObject(window_ready_event, INFINITE);
 
-    // create swap chain, device and context
-    {
-        DXGI_SWAP_CHAIN_DESC desc = {};
-        desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        desc.SampleDesc = { 1, 0 };
-        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc.BufferCount = 2;
-        desc.OutputWindow = window;
-        desc.Windowed = TRUE;
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-
-        UINT flags = 0;
-#ifndef NDEBUG
-        flags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif
-        D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0 };
-        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags, levels, _countof(levels), D3D11_SDK_VERSION, &desc, &swapChain, &device, NULL, &context);
-        AssertHR(hr);
-    }
-
-#ifndef NDEBUG
-    {
-        ID3D11Debug* debug;
-        ID3D11InfoQueue* info;
-        hr = device->QueryInterface(&debug);
-        AssertHR(hr);
-        hr = debug->QueryInterface(&info);
-        AssertHR(hr);
-        hr = info->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_CORRUPTION, TRUE);
-        AssertHR(hr);
-        hr = info->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_ERROR, TRUE);
-        AssertHR(hr);
-        info->Release();
-        debug->Release();
-    }
-#endif
-
-    {
-        D3D11_BUFFER_DESC desc = {};
-        desc.ByteWidth = MAX_WIDTH * MAX_HEIGHT * sizeof(Vertex);
-        desc.Usage = D3D11_USAGE_DYNAMIC;
-        desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-        hr = device->CreateBuffer(&desc, NULL, &vbuffer);
-        AssertHR(hr);
-    }
-
-    {
-        // these must match vertex shader input layout
-        D3D11_INPUT_ELEMENT_DESC desc[] =
-        {
-            { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,    0, offsetof(Vertex, pos),   D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, offsetof(Vertex, uv),    D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM,    0, offsetof(Vertex, color), D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "BACKG", 0, DXGI_FORMAT_R8G8B8A8_UNORM,    0, offsetof(Vertex, backg), D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        };
-
-        const char hlsl[] =
-            "#line " STR(__LINE__) "                                    \n\n"
-            "                                                             \n"
-            "struct VS_INPUT                                              \n"
-            "{                                                            \n"
-            "     float2 pos   : POSITION;                                \n"
-            "     float2 uv    : TEXCOORD;                                \n"
-            "     float4 color : COLOR;                                   \n"
-            "     float4 backg : BACKG;                                   \n"
-            "};                                                           \n"
-            "                                                             \n"
-            "struct PS_INPUT                                              \n"
-            "{                                                            \n"
-            "  float4 pos   : SV_POSITION;                                \n"
-            "  float2 uv    : TEXCOORD;                                   \n"
-            "  float4 color : COLOR;                                      \n"
-            "  float4 backg : BACKG;                                      \n"
-            "};                                                           \n"
-            "                                                             \n"
-            "cbuffer cbuffer0 : register(b0)                              \n"
-            "{                                                            \n"
-            "    float4x4 uTransform;                                     \n"
-            "}                                                            \n"
-            "                                                             \n"
-            "sampler sampler0 : register(s0);                             \n"
-            "                                                             \n"
-            "Texture2D<float3> texture0 : register(t0);                   \n"
-            "                                                             \n"
-            "PS_INPUT vs(VS_INPUT input)                                  \n"
-            "{                                                            \n"
-            "    PS_INPUT output;                                         \n"
-            "    output.pos = mul(uTransform, float4(input.pos, 0, 1));   \n"
-            "    output.uv = input.uv;                                    \n"
-            "    output.color = input.color;                              \n"
-            "    output.backg = input.backg;                              \n"
-            "    return output;                                           \n"
-            "}                                                            \n"
-            "                                                             \n"
-            "float4 ps(PS_INPUT input) : SV_TARGET                        \n"
-            "{                                                            \n"
-            "    float tex = texture0.Sample(sampler0, input.uv).r;       \n"
-            "    return lerp(input.backg, input.color, tex);              \n"
-            "}                                                            \n"
-            ;
-
-        UINT flags = D3DCOMPILE_PACK_MATRIX_ROW_MAJOR | D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_WARNINGS_ARE_ERRORS;
-#ifndef NDEBUG
-        flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
-#else
-        flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
-#endif
-
-        ID3DBlob* error;
-
-        ID3DBlob* vblob;
-        hr = D3DCompile(hlsl, sizeof(hlsl), NULL, NULL, NULL, "vs", "vs_5_0", flags, 0, &vblob, &error);
-        if (FAILED(hr))
-        {
-            const char* message = (const char*)error->GetBufferPointer();
-            OutputDebugStringA(message);
-            Assert(!"Failed to compile vertex shader!");
-        }
-
-        ID3DBlob* pblob;
-        hr = D3DCompile(hlsl, sizeof(hlsl), NULL, NULL, NULL, "ps", "ps_5_0", flags, 0, &pblob, &error);
-        if (FAILED(hr))
-        {
-            const char* message = (const char*)error->GetBufferPointer();
-            OutputDebugStringA(message);
-            Assert(!"Failed to compile pixel shader!");
-        }
-
-        hr = device->CreateVertexShader(vblob->GetBufferPointer(), vblob->GetBufferSize(), NULL, &vshader);
-        AssertHR(hr);
-
-        hr = device->CreatePixelShader(pblob->GetBufferPointer(), pblob->GetBufferSize(), NULL, &pshader);
-        AssertHR(hr);
-
-        hr = device->CreateInputLayout(desc, _countof(desc), vblob->GetBufferPointer(), vblob->GetBufferSize(), &layout);
-        AssertHR(hr);
-
-        pblob->Release();
-        vblob->Release();
-    }
-
-    {
-        D3D11_BUFFER_DESC desc = {};
-        desc.ByteWidth = 4 * 4 * sizeof(float);
-        desc.Usage = D3D11_USAGE_DYNAMIC;
-        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        hr = device->CreateBuffer(&desc, NULL, &ubuffer);
-        AssertHR(hr);
-    }
-
-    {
-        BITMAPINFO info = {};
-        info.bmiHeader.biSize = sizeof(info.bmiHeader);
-        info.bmiHeader.biWidth = 256 * 8;
-        info.bmiHeader.biHeight = 16;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB;
-
-        void* bits;
-        HDC dc = CreateCompatibleDC(0);
-        HBITMAP bmp = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, NULL, 0);
-        SelectObject(dc, bmp);
-
-        HFONT font = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY, FIXED_PITCH, "PxPlus IBM VGA8");
-        SelectObject(dc, font);
-
-        SetTextColor(dc, RGB(255, 255, 255));
-        SetBkColor(dc, RGB(0, 0, 0));
-        for (int i = 0; i < 256; i++)
-        {
-            RECT r = { i * 8, 0, i * 8 + 8, 16 };
-            char ch = (char)i;
-            ExtTextOutA(dc, i * 8, 0, ETO_OPAQUE, &r, &ch, 1, NULL);
-        }
-
-        {
-            // cursor, doesn't look right in A version
-            RECT r = { 0xdb * 8, 0, 0xdb * 8 + 8, 16 };
-            wchar_t ch = 0x2588;
-            ExtTextOutW(dc, 0xdb * 8, 0, ETO_OPAQUE, &r, &ch, 1, NULL);
-        }
-
-        D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = 256 * 8;
-        desc.Height = 16;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.SampleDesc = { 1, 0 };
-        desc.Usage = D3D11_USAGE_IMMUTABLE;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-        D3D11_SUBRESOURCE_DATA data = {};
-        data.pSysMem = bits;
-        data.SysMemPitch = 256 * 8 * 4;
-
-        ID3D11Texture2D* texture;
-        hr = device->CreateTexture2D(&desc, &data, &texture);
-        AssertHR(hr);
-
-        hr = device->CreateShaderResourceView(texture, NULL, &textureView);
-        AssertHR(hr);
-
-        texture->Release();
-    }
-
-    {
-        D3D11_SAMPLER_DESC desc = {};
-        desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
-        desc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
-        desc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
-        desc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
-
-        hr = device->CreateSamplerState(&desc, &sampler);
-        AssertHR(hr);
-    }
-
-    // disable culling
-    {
-        D3D11_RASTERIZER_DESC desc = {};
-        desc.FillMode = D3D11_FILL_SOLID;
-        desc.CullMode = D3D11_CULL_NONE;
-        hr = device->CreateRasterizerState(&desc, &rasterizerState);
-        AssertHR(hr);
-    }
-
-    LARGE_INTEGER freq, time;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&time);
-
-    DWORD frames = 0;
-    INT64 next = time.QuadPart + freq.QuadPart;
-
-    static DWORD currentWidth = 0;
-    static DWORD currentHeight = 0;
     bool events_added = false;
 
     console_mutex = CreateMutex(0, false, L"ConsoleMutex");
@@ -2638,187 +2430,238 @@ int WINAPI WinMain(
     // setup terminal dimensions here so that process already can write out correctly
     RECT rect;
     GetClientRect(window, &rect);
-    DWORD width = rect.right - rect.left;
-    DWORD height = rect.bottom - rect.top;
-    COORD size = { (SHORT)(width / 8), (SHORT)(height / 16) };
+    int MinTermSize = 64;
+    DWORD Width = rect.right - rect.left;
+    DWORD Height = rect.bottom - rect.top;
+    COORD size = { (SHORT)(Width / 8), (SHORT)(Height / 16) };
     initialize_term_output_buffer(frontbuffer, size, true);
+    
+    frontbuffer.REFTERM_TEXTURE_WIDTH = 2048;
+    frontbuffer.REFTERM_TEXTURE_HEIGHT = 2048;
+
+    // TODO(casey): Auto-size this, somehow?  The TransferHeight effectively restricts the maximum size of the
+    // font, so it may want to be "grown" based on the font size selected.
+    frontbuffer.TransferWidth = 1024;
+    frontbuffer.TransferHeight = 512;
+
+    frontbuffer.REFTERM_MAX_WIDTH = 1024;
+    frontbuffer.REFTERM_MAX_HEIGHT = 1024;
+
+    frontbuffer.Renderer = AcquireD3D11Renderer(window, _DEBUG);
+    SetD3D11MaxCellCount(&frontbuffer.Renderer, frontbuffer.REFTERM_MAX_WIDTH * frontbuffer.REFTERM_MAX_HEIGHT);
+    SetD3D11GlyphCacheDim(&frontbuffer.Renderer, frontbuffer.REFTERM_TEXTURE_WIDTH, frontbuffer.REFTERM_TEXTURE_HEIGHT);
+    SetD3D11GlyphTransferDim(&frontbuffer.Renderer, frontbuffer.TransferWidth, frontbuffer.TransferHeight);
+
+    frontbuffer.GlyphGen = AllocateGlyphGenerator(frontbuffer.TransferWidth, frontbuffer.TransferHeight, frontbuffer.Renderer.GlyphTransferSurface);
+
+    ScriptRecordDigitSubstitution(LOCALE_USER_DEFAULT, &frontbuffer.Partitioner.UniDigiSub); // TODO(casey): Move this out to the stored code
+    ScriptApplyDigitSubstitution(&frontbuffer.Partitioner.UniDigiSub, &frontbuffer.Partitioner.UniControl, &frontbuffer.Partitioner.UniState);
+
+    wsprintfW(frontbuffer.RequestedFontName, L"%s", L"Courier New");
+    frontbuffer.RequestedFontHeight = 16;
+    RefreshFont(&frontbuffer);
+
     SetupConsoleAndProcess();
+
+    LARGE_INTEGER Frequency, Time;
+    QueryPerformanceFrequency(&Frequency);
+    QueryPerformanceCounter(&Time);
+
+    LARGE_INTEGER StartTime;
+    QueryPerformanceCounter(&StartTime);
+
+    size_t FrameCount = 0;
+    size_t FrameIndex = 0;
+    int64_t UpdateTitle = Time.QuadPart + Frequency.QuadPart;    
+
+    bool no_throttle = false;
+    uint32_t blink_ms = 500;
 
     while(!console_exit)
     {
-        RECT rect;
-        GetClientRect(window, &rect);
-        DWORD width = rect.right - rect.left;
-        DWORD height = rect.bottom - rect.top;
+        if (!no_throttle) {
+            DWORD res = WaitForSingleObject(buffer_update_event, blink_ms);
+            // debug_printf_a("Waiting finished with res=%d\n", res);
+        }
+        RECT Rect;
+        GetClientRect(window, &Rect);
 
-        if (rtView == NULL || width != currentWidth || height != currentHeight)
+        if (((Rect.left + MinTermSize) <= Rect.right) &&
+            ((Rect.top + MinTermSize) <= Rect.bottom))
         {
-            if (rtView)
+            Width = Rect.right - Rect.left;
+            Height = Rect.bottom - Rect.top;
+
+            uint32_t NewDimX = SafeRatio1(Width, frontbuffer.GlyphGen.FontWidth);
+            uint32_t NewDimY = SafeRatio1(Height, frontbuffer.GlyphGen.FontHeight);
+            if (NewDimX > frontbuffer.REFTERM_MAX_WIDTH) NewDimX = frontbuffer.REFTERM_MAX_WIDTH;
+            if (NewDimY > frontbuffer.REFTERM_MAX_HEIGHT) NewDimY = frontbuffer.REFTERM_MAX_HEIGHT;
+
+            // TODO(casey): Maybe only allocate on size differences,
+            // etc. Make a real resize function here for people who care.
+            if ((frontbuffer.size.X != NewDimX) ||
+                (frontbuffer.size.Y != NewDimY))
             {
-                // release old swap chain buffers
-                context->ClearState();
-                rtView->Release();
-                rtView = NULL;
+                FastFast_LockTerminal();
+                FastFast_Resize((SHORT)NewDimX, (SHORT)NewDimY);
+                FastFast_UnlockTerminal();
             }
+        }
 
-            if (width != 0 && height != 0)
+        if (frontbuffer.Renderer.FrameLatencyWaitableObject != INVALID_HANDLE_VALUE) {
+            WaitForSingleObjectEx(
+                frontbuffer.Renderer.FrameLatencyWaitableObject,
+                1000, // 1 second timeout (shouldn't ever occur)
+                true
+            );
+        }
+
+        {
             {
-                hr = swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
-                AssertHR(hr);
-
-                ID3D11Texture2D* backbuffer;
-                hr = swapChain->GetBuffer(0, IID_ID3D11Texture2D, (void**)&backbuffer);
-                AssertHR(hr);
-                hr = device->CreateRenderTargetView(backbuffer, NULL, &rtView);
-                AssertHR(hr);
-                backbuffer->Release();
+                // may set incorrect values since it's done without lock, 
+                // but it can't be under lock since then we can deadlock with DefWindowProc
+                static SCROLLINFO si = { 0 };
+                uint32_t nMax = frontbuffer.scrollback_available;
+                uint32_t nPos = frontbuffer.scrollback_available - frontbuffer.scrollback;
+                // poor man's dirty checking
+                if (si.nMax != nMax || si.nPos != nPos) {
+                    si.cbSize = sizeof(si);
+                    si.fMask = SIF_ALL;
+                    si.nMin = 0;
+                    si.nMax = nMax;
+                    si.nPos = nPos;
+                    SetScrollInfo(window, SB_VERT, &si, true);
+                }
             }
-
-            currentWidth = width;
-            currentHeight = height;
 
             FastFast_LockTerminal();
-            FastFast_Resize((SHORT)(currentWidth / 8), (SHORT)(currentHeight / 16));
+            TermChar* t = check_wrap_backwards(&frontbuffer, frontbuffer.buffer - frontbuffer.size.X * frontbuffer.scrollback);
+            TermChar* t_wrap = get_wrap_ptr(&frontbuffer);
+            size_t required_renderer_size = frontbuffer.size.X * frontbuffer.size.Y * sizeof(renderer_cell);
+            if (frontbuffer.RenderCells_size < required_renderer_size) {
+                frontbuffer.RenderCells_size = required_renderer_size;
+                frontbuffer.RenderCells = (renderer_cell*)realloc(frontbuffer.RenderCells, required_renderer_size);
+            }
+            renderer_cell* render_cell = frontbuffer.RenderCells;
+            for (int y = 0; y < frontbuffer.size.Y; y++)
+            {
+                for (int x = 0; x < frontbuffer.size.X; /* x incremented in each branch */)
+                {
+                    if (IsDirectCodepoint(t->ch))
+                    {
+                        gpu_glyph_index GPUIndex = frontbuffer.ReservedTileTable[t->ch - MinDirectCodepoint];
+                        render_cell->GlyphIndex = GPUIndex.Value;
+                        render_cell->Foreground = t->attr.color;
+                        render_cell->Background = t->attr.backg;
+
+                        ++render_cell;
+                        ++t;
+                        ++x;
+                    } else if (t->ch) {
+                        glyph_hash RunHash;
+                        glyph_dim GlyphDim;
+                        wchar_t* Run;
+                        size_t Chars;
+                        if (!t->attr.complex) {
+                            RunHash = ComputeGlyphHash(2, (unsigned char*)&t->ch, DefaultSeed);
+                            GlyphDim = GetGlyphDim(&frontbuffer.GlyphGen, frontbuffer.GlyphTable, 1, &t->ch, RunHash);
+                            Run = &t->ch;
+                            Chars = 1;
+                        } else {
+                            RunHash = t->complex_ch->hash;
+                            GlyphDim = t->complex_ch->dim;
+                            Run = t->complex_ch->start;
+                            Chars = t->complex_ch->len;
+                        }
+                        // zero width char, still occupies a slot in buffer
+                        if (!GlyphDim.TileCount) {
+                            ++x;
+                            ++t;
+                            ++render_cell;
+                        } else {
+                            int Prepped = 0;
+                            for (uint32_t TileIndex = 0;
+                                TileIndex < GlyphDim.TileCount;
+                                ++TileIndex)
+                            {
+                                glyph_hash TileHash = ComputeHashForTileIndex(RunHash, TileIndex);
+                                glyph_state Entry = FindGlyphEntryByHash(frontbuffer.GlyphTable, TileHash);
+                                if (Entry.FilledState != GlyphState_Rasterized)
+                                {
+                                    if (!Prepped)
+                                    {
+                                        PrepareTilesForTransfer(&frontbuffer.GlyphGen, &frontbuffer.Renderer, Chars, Run, GlyphDim);
+                                        Prepped = 1;
+                                    }
+
+                                    TransferTile(&frontbuffer.GlyphGen, &frontbuffer.Renderer, TileIndex, Entry.GPUIndex);
+                                    UpdateGlyphCacheEntry(frontbuffer.GlyphTable, Entry.ID, GlyphState_Rasterized, Entry.DimX, Entry.DimY);
+                                }
+
+                                render_cell->GlyphIndex = Entry.GPUIndex.Value;
+                                render_cell->Foreground = t->attr.color;
+                                render_cell->Background = t->attr.backg;
+                                ++render_cell;
+                                ++t;
+                                ++x;
+                            }
+                        }
+                    } else {
+                        render_cell->GlyphIndex = 0;
+                        render_cell->Foreground = t->attr.color;
+                        render_cell->Background = t->attr.backg;
+                        ++render_cell;
+                        ++t;
+                        ++x;
+                    }
+                }
+                if (t >= t_wrap) {
+                    t = frontbuffer.buffer_start;
+                }
+            }
+            //if (show_cursor) {
+            //    vtx = AddChar(vtx, 0xdb, frontbuffer.cursor_pos.X, frontbuffer.cursor_pos.Y + frontbuffer.scrollback, 0xffffff, 0);
+            //}
             FastFast_UnlockTerminal();
         }
 
-        if (rtView)
+        // TODO(casey): Split RendererDraw into two!
+        // Update, and render, since we only need to update if we actually get new input.
+
+        LARGE_INTEGER BlinkTimer;
+        QueryPerformanceCounter(&BlinkTimer);
+        int Blink = ((2 * (BlinkTimer.QuadPart - StartTime.QuadPart) / (Frequency.QuadPart)) & 1);
+        if (!frontbuffer.Renderer.Device)
         {
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            if (now.QuadPart > next)
-            {
-                show_cursor = !show_cursor;
-                next = now.QuadPart + freq.QuadPart;
-
-                float fps = float(double(frames) * freq.QuadPart / (now.QuadPart - time.QuadPart));
-                time = now;
-                frames = 0;
-
-                WCHAR title[1024];
-                _snwprintf(title, _countof(title), L"%s Size=%dx%d RenderFPS=%.2f", console_title,frontbuffer.size.X, frontbuffer.size.Y, fps);
-                SetWindowTextW(window, title);
-            }
-
-            D3D11_VIEWPORT viewport = {};
-            viewport.Width = (FLOAT)width;
-            viewport.Height = (FLOAT)height;
-            viewport.MinDepth = 0;
-            viewport.MaxDepth = 1;
-
-            {
-                float l = 0;
-                float r = (float)width;
-                float t = 0;
-                float b = (float)height;
-
-                float x = 2.0f / (r - l);
-                float y = 2.0f / (t - b);
-                float z = 0.5f;
-
-                float matrix[4 * 4] =
-                {
-                    x, 0, 0, (r + l) / (l - r),
-                    0, y, 0, (t + b) / (b - t),
-                    0, 0, z, 0.5f,
-                    0, 0, 0, 1.0f,
-                };
-
-                D3D11_MAPPED_SUBRESOURCE mapped;
-                hr = context->Map(ubuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-                AssertHR(hr);
-                memcpy(mapped.pData, matrix, sizeof(matrix));
-                context->Unmap(ubuffer, 0);
-            }
-
-            UINT count = 0;
-            {
-                D3D11_MAPPED_SUBRESOURCE mapped;
-                hr = context->Map(vbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-                AssertHR(hr);
-
-                Vertex* vtx = (Vertex*)mapped.pData;
-
-#if 0
-                static int backg = 1;
-                for (int y = 0; y < termH; y++)
-                {
-                    for (int x = 0; x < termW; x++)
-                    {
-                        static char ch = 0;
-                        vtx = AddChar(vtx, ch++, x, y, 0xffffff, backg++);
-                    }
-                }
-#else
-                // may set incorrect values since it's done without lock, 
-                // but it can't be under lock since then we can deadlock with DefWindowProc
-                SCROLLINFO si = { 0 };
-                si.cbSize = sizeof(si);
-                si.fMask = SIF_ALL;
-                si.nMin = 0;
-                si.nMax = frontbuffer.scrollback_available;
-                si.nPos = frontbuffer.scrollback_available - frontbuffer.scrollback;
-                SetScrollInfo(window, SB_VERT, &si, true);
-
-                FastFast_LockTerminal();
-                TermChar* t = check_wrap_backwards(&frontbuffer, frontbuffer.buffer - frontbuffer.size.X * frontbuffer.scrollback);
-                TermChar* t_wrap = get_wrap_ptr(&frontbuffer);
-                for (int y = 0; y < frontbuffer.size.Y; y++)
-                {
-                    for (int x = 0; x < frontbuffer.size.X; x++)
-                    {
-                        vtx = AddChar(vtx, (char)t->ch, x, y, t->attr.color, t->attr.backg);
-                        t++;
-                    }
-                    if (t >= t_wrap) {
-                        t = frontbuffer.buffer_start;
-                    }
-                }
-                if (show_cursor) {
-                    vtx = AddChar(vtx, 0xdb, frontbuffer.cursor_pos.X, frontbuffer.cursor_pos.Y + frontbuffer.scrollback, 0xffffff, 0);
-                }
-                FastFast_UnlockTerminal();
-#endif
-                count = (UINT)(vtx - (Vertex*)mapped.pData);
-
-                context->Unmap(vbuffer, 0);
-            }
-
-            float clear_color[4] = { 0, 0, 0, 1 };
-            context->ClearRenderTargetView(rtView, clear_color);
-            context->IASetInputLayout(layout);
-            context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            UINT stride = sizeof(struct Vertex);
-            UINT offset = 0;
-            context->IASetVertexBuffers(0, 1, &vbuffer, &stride, &offset);
-
-            context->VSSetConstantBuffers(0, 1, &ubuffer);
-            context->VSSetShader(vshader, NULL, 0);
-
-            context->RSSetViewports(1, &viewport);
-            context->RSSetState(rasterizerState);
-
-            context->PSSetSamplers(0, 1, &sampler);
-            context->PSSetShaderResources(0, 1, &textureView);
-            context->PSSetShader(pshader, NULL, 0);
-
-            context->OMSetRenderTargets(1, &rtView, NULL);
-
-            context->Draw(count, 0);
-
-            frames++;
+            frontbuffer.Renderer = AcquireD3D11Renderer(window, _DEBUG);
+            RefreshFont(&frontbuffer);
         }
-
-        BOOL vsync = FALSE;
-        hr = swapChain->Present(vsync ? 1 : 0, 0);
-        if (hr == DXGI_STATUS_OCCLUDED)
+        if (frontbuffer.Renderer.Device)
         {
-            // window is minimized, cannot vsync - instead sleep a bit
-            if (vsync)
-            {
-                Sleep(10);
-            }
+            RendererDraw(&frontbuffer, Width, Height, Blink ? 0xffffffff : 0xff222222);
         }
-        AssertHR(hr);
+        ++FrameIndex;
+        ++FrameCount;
+
+        LARGE_INTEGER Now;
+        QueryPerformanceCounter(&Now);
+
+        if (Now.QuadPart >= UpdateTitle)
+        {
+            UpdateTitle = Now.QuadPart + Frequency.QuadPart;
+
+            double FramesPerSec = (double)FrameCount * Frequency.QuadPart / (Now.QuadPart - Time.QuadPart);
+            Time = Now;
+            FrameCount = 0;
+
+            WCHAR Title[1024];
+
+            glyph_table_stats Stats = GetAndClearStats(frontbuffer.GlyphTable);
+            wsprintfW(Title, L"%s Size=%dx%d RenderFPS=%d.%02d CacheHits/Misses=%d/%d Recycle:%d",
+                console_title, frontbuffer.size.X, frontbuffer.size.Y, (int)FramesPerSec, (int)(FramesPerSec * 100) % 100,
+                (int)Stats.HitCount, (int)Stats.MissCount, (int)Stats.RecycleCount);
+
+            SetWindowTextW(window, Title);
+        }
     }
 }

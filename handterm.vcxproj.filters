@@ -9,10 +9,27 @@
     <ClInclude Include="src\conmsgl3.h" />
     <ClInclude Include="src\shared.h" />
     <ClInclude Include="src\vtparser.h" />
+    <ClInclude Include="src\refterm_cs.h" />
+    <ClInclude Include="src\refterm_example_d3d11.h" />
+    <ClInclude Include="src\refterm_example_dwrite.h" />
+    <ClInclude Include="src\refterm_example_glyph_generator.h" />
+    <ClInclude Include="src\refterm_example_source_buffer.h" />
+    <ClInclude Include="src\refterm_glyph_cache.h" />
+    <ClInclude Include="src\refterm_ps.h" />
+    <ClInclude Include="src\refterm_vs.h" />
+    <ClInclude Include="src\terminal.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\handles.cpp" />
     <ClCompile Include="src\handterm.cpp" />
     <ClCompile Include="src\vtparser.cpp" />
+    <ClCompile Include="src\refterm_example_d3d11.c" />
+    <ClCompile Include="src\refterm_example_dwrite.cpp" />
+    <ClCompile Include="src\refterm_example_glyph_generator.c" />
+    <ClCompile Include="src\refterm_example_source_buffer.c" />
+    <ClCompile Include="src\refterm_glyph_cache.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <FxCompile Include="src\refterm.hlsl" />
   </ItemGroup>
 </Project>
