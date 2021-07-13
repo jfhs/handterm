@@ -384,9 +384,20 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
         wchar_t c = *str;
         if (vt_processing_enabled)
         {
-            action = vt_process_char_w(&tb.vt_state, str, count == 1);
-            str++;
-            count--;
+            wchar_t cnext = *(str + 1);
+            // ESC + 7bit control characters.
+            if (c == L'\x1b' && cnext >= L'\x40' && cnext <= L'\x5f') {
+                // Convert it to C1 control codes.
+                c = cnext + L'\x40';
+                action = vt_process_char_w(&tb.vt_state, &c, count == 1);
+                str += 2;
+                count -= 2;
+            }
+            else {
+                action = vt_process_char_w(&tb.vt_state, str, count == 1);
+                str++;
+                count--;
+            }
 
             switch (action) {
             case CsiDispatch: {
