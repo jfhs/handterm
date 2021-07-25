@@ -2,3 +2,6 @@
 Debug
 x64
 .exe
+*.vim
+*.swp
+*.vcxproj.user
