@@ -18,6 +18,21 @@
       <Platform>x64</Platform>
     </ProjectConfiguration>
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\colors.h" />
+    <ClInclude Include="src\condefs.h" />
+    <ClInclude Include="src\condrv.h" />
+    <ClInclude Include="src\conmsgl1.h" />
+    <ClInclude Include="src\conmsgl2.h" />
+    <ClInclude Include="src\conmsgl3.h" />
+    <ClInclude Include="src\shared.h" />
+    <ClInclude Include="src\vtparser.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\handles.cpp" />
+    <ClCompile Include="src\handterm.cpp" />
+    <ClCompile Include="src\vtparser.cpp" />
+  </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>16.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
@@ -139,21 +154,6 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
-  <ItemGroup>
-    <ClCompile Include="handles.cpp" />
-    <ClCompile Include="handterm.cpp" />
-    <ClCompile Include="vtparser.cpp" />
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="colors.h" />
-    <ClInclude Include="condefs.h" />
-    <ClInclude Include="condrv.h" />
-    <ClInclude Include="conmsgl1.h" />
-    <ClInclude Include="conmsgl2.h" />
-    <ClInclude Include="conmsgl3.h" />
-    <ClInclude Include="shared.h" />
-    <ClInclude Include="vtparser.h" />
-  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
