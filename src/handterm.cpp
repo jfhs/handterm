@@ -1,7 +1,6 @@
 #define _CRT_SECURE_NO_DEPRECATE
 #define NOMINMAX
 #include <windows.h>
-#include <ntstatus.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <math.h>
@@ -71,7 +70,7 @@ typedef struct CharAttributes {
     int backg;
     bool bold;
     bool soft_wrap;
-};
+} CharAttributes;
 
 typedef struct TermChar {
     int ch;
@@ -1303,7 +1302,7 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                 return STATUS_TIMEOUT;
             }
             write_op.Buffer.Data = input_buf;
-            write_op.Buffer.Size = input_buf_bytes_written;
+            write_op.Buffer.Size = (ULONG)input_buf_bytes_written;
         } else {
             // no data available to read right away, buffer until we get CR
             if (!input_buf_bytes_read) {
@@ -1417,7 +1416,7 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
             }
             // if we got here, we either got CR or there was some data from previous line read request
             size_t bytes_left = input_buf_bytes_written - input_buf_bytes_read;
-            ULONG bytes_to_write = min(bytes_left, user_write_buffer_size);
+            ULONG bytes_to_write = (ULONG)min(bytes_left, user_write_buffer_size);
             write_op.Buffer.Data = input_buf + input_buf_bytes_read;
             write_op.Buffer.Size = bytes_to_write;
         }
@@ -1467,11 +1466,11 @@ HRESULT HandleGetInputMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_co
     // we have some buffered data
     if (input_buf_bytes_written) {
         write_op.Buffer.Data = input_buf + input_buf_bytes_read;
-        write_op.Buffer.Size = min(input_buf_bytes_written - input_buf_bytes_read, user_write_buffer_size);
+        write_op.Buffer.Size = (ULONG)min(input_buf_bytes_written - input_buf_bytes_read, user_write_buffer_size);
     } else {
         if (!vt_input_enabled) {
-            input_msg->NumRecords = min(user_write_buffer_size / sizeof(INPUT_RECORD), write_ptr - read_ptr);
-            size_t bytes = sizeof(INPUT_RECORD) * input_msg->NumRecords;
+            input_msg->NumRecords = (ULONG)min(user_write_buffer_size / sizeof(INPUT_RECORD), write_ptr - read_ptr);
+            ULONG bytes = sizeof(INPUT_RECORD) * input_msg->NumRecords;
 
             write_op.Buffer.Data = read_ptr;
             write_op.Buffer.Size = bytes;
@@ -1482,7 +1481,7 @@ HRESULT HandleGetInputMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_co
             PINPUT_RECORD ebuf = (PINPUT_RECORD)input_buf;
             while (read_ptr != write_ptr) {
                 bool replaced = false;
-                if (read_ptr->EventType == KEY_EVENT && read_ptr->Event.KeyEvent.bKeyDown == true && !read_ptr->Event.KeyEvent.uChar.UnicodeChar) {
+                if (read_ptr->EventType == KEY_EVENT && read_ptr->Event.KeyEvent.bKeyDown == TRUE && !read_ptr->Event.KeyEvent.uChar.UnicodeChar) {
                     size_t written;
                     char cbuf[8]; // all VT sequences should fit here
                     // should always succeed as we provide large enough buf
@@ -1518,7 +1517,7 @@ HRESULT HandleGetInputMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_co
                 read_ptr++;
             }
             write_op.Buffer.Data = input_buf;
-            write_op.Buffer.Size = min(input_buf_bytes_written, user_write_buffer_size);
+            write_op.Buffer.Size = (ULONG)min(input_buf_bytes_written, user_write_buffer_size);
         }
     }
 
@@ -1561,8 +1560,8 @@ HRESULT HandleWriteMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_compl
 
     PCONSOLE_WRITECONSOLE_MSG write_msg = &ReceiveMsg->u.consoleMsgL1.WriteConsoleW; // this WriteConsole macro...
     // no offset with raw requests
-    size_t read_offset = ReceiveMsg->Descriptor.Function == CONSOLE_IO_RAW_WRITE ? 0 : ReceiveMsg->msgHeader.ApiDescriptorSize + sizeof(CONSOLE_MSG_HEADER);
-    size_t bytes = ReceiveMsg->Descriptor.InputSize - read_offset;
+    ULONG read_offset = ReceiveMsg->Descriptor.Function == CONSOLE_IO_RAW_WRITE ? 0 : ReceiveMsg->msgHeader.ApiDescriptorSize + sizeof(CONSOLE_MSG_HEADER);
+    ULONG bytes = ReceiveMsg->Descriptor.InputSize - read_offset;
     if (output_buf_size < bytes) {
         output_buf = (char*)realloc(output_buf, bytes);
         output_buf_size = bytes;
@@ -1717,7 +1716,8 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
 
             if (data.ConsoleApp) {
                 CONSOLE_PROCESS_INFO cpi;
-                cpi.dwProcessID = ReceiveMsg.Descriptor.Process;
+                // TODO[oscar] Should we hash this instead?
+                cpi.dwProcessID = (DWORD)ReceiveMsg.Descriptor.Process;
                 cpi.dwFlags = CPI_NEWPROCESSWINDOW;
 
                 _ConsoleControl(ConsoleNotifyConsoleApplication, &cpi, sizeof(cpi));
@@ -1784,7 +1784,7 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                 // not supported yet
             }
             io_complete.IoStatus.Status = handle == INVALID_HANDLE_VALUE ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
-            io_complete.IoStatus.Information = (ULONG)handle;
+            io_complete.IoStatus.Information = (ULONG_PTR)handle;
             break;
         }
         case CONSOLE_IO_RAW_READ:
@@ -1896,9 +1896,9 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                     PINPUT_RECORD write_ptr = pending_events_write_ptr;
                     PINPUT_RECORD read_ptr = pending_events_read_ptr;
                     if (read_ptr <= write_ptr) {
-                        get_input_cnt_msg->ReadyEvents = write_ptr - read_ptr;
+                        get_input_cnt_msg->ReadyEvents = (ULONG)(write_ptr - read_ptr);
                     } else {
-                        get_input_cnt_msg->ReadyEvents = (pending_events_wrap_ptr - read_ptr) + (write_ptr - pending_events);
+                        get_input_cnt_msg->ReadyEvents = (ULONG)((pending_events_wrap_ptr - read_ptr) + (write_ptr - pending_events));
                     }
                     io_complete.IoStatus.Status = STATUS_SUCCESS;
                     break;
@@ -1976,7 +1976,7 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                         // WideCharToMultiByte
                     }
 
-                    size_t bytes = (lstrlenW(console_title) + 1) * sizeof(wchar_t);
+                    int bytes = (lstrlenW(console_title) + 1) * sizeof(wchar_t);
                     CD_IO_OPERATION write_op = { 0 };
                     write_op.Identifier = ReceiveMsg.Descriptor.Identifier;
                     write_op.Buffer.Offset = ReceiveMsg.msgHeader.ApiDescriptorSize;
@@ -1994,8 +1994,8 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                 }
                 case Api_SetConsoleTitle: {
                     PCONSOLE_SETTITLE_MSG set_title_msg = &ReceiveMsg.u.consoleMsgL2.SetConsoleTitleW; 
-                    size_t read_offset = ReceiveMsg.msgHeader.ApiDescriptorSize + sizeof(CONSOLE_MSG_HEADER);
-                    size_t bytes = ReceiveMsg.Descriptor.InputSize - read_offset;
+                    ULONG read_offset = ReceiveMsg.msgHeader.ApiDescriptorSize + sizeof(CONSOLE_MSG_HEADER);
+                    ULONG bytes = ReceiveMsg.Descriptor.InputSize - read_offset;
                     if (!set_title_msg->Unicode) {
                         Assert(!"Not supported");
                         // WideCharToMultiByte
@@ -2194,7 +2194,7 @@ static LRESULT CALLBACK WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lPa
             key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
             key_event.Event.KeyEvent.bKeyDown = !((lParam >> 31) & 1); // if bit 31 is set, char is being released
             key_event.Event.KeyEvent.wRepeatCount = LOWORD(lParam);
-            key_event.Event.KeyEvent.uChar.UnicodeChar = wParam;
+            key_event.Event.KeyEvent.uChar.UnicodeChar = (WCHAR)wParam;
             key_event.Event.KeyEvent.dwControlKeyState = GetControlKeysState();
             PushEvent(key_event);
             SetEvent(delayed_io_event);
@@ -2226,7 +2226,7 @@ typedef struct Vertex
 } Vertex;
 
 
-static Vertex* AddChar(Vertex* vtx, char ch, int x, int y, int color, int backg)
+static Vertex* AddChar(Vertex* vtx, unsigned char ch, int x, int y, int color, int backg)
 {
     float w = 8;
     float h = 16;
@@ -2247,7 +2247,7 @@ static Vertex* AddChar(Vertex* vtx, char ch, int x, int y, int color, int backg)
 
 void SetupConsoleAndProcess() 
 {
-    DWORD RetBytes = 0, err;
+    DWORD RetBytes = 0;
 
     _NtOpenFile = (PfnNtOpenFile)GetProcAddress(LoadLibraryExW(L"ntdll.dll", 0, LOAD_LIBRARY_SEARCH_SYSTEM32), "NtOpenFile");
     _ConsoleControl = (PfnConsoleControl)GetProcAddress(LoadLibraryExW(L"user32.dll", 0, LOAD_LIBRARY_SEARCH_SYSTEM32), "ConsoleControl");
@@ -2619,7 +2619,6 @@ int WINAPI WinMain(
     static DWORD currentWidth = 0;
     static DWORD currentHeight = 0;
     bool events_added = false;
-    MSG keydown_msg;
 
     console_mutex = CreateMutex(0, false, L"ConsoleMutex");
     Assert(console_mutex);
