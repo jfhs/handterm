@@ -1302,6 +1302,7 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
                 return STATUS_TIMEOUT;
             }
             write_op.Buffer.Data = input_buf;
+            Assert( input_buf_bytes_written < ULONG_MAX );
             write_op.Buffer.Size = (ULONG)input_buf_bytes_written;
         } else {
             // no data available to read right away, buffer until we get CR
@@ -1416,6 +1417,7 @@ HRESULT HandleReadMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_comple
             }
             // if we got here, we either got CR or there was some data from previous line read request
             size_t bytes_left = input_buf_bytes_written - input_buf_bytes_read;
+            Assert( bytes_left < ULONG_MAX );
             ULONG bytes_to_write = (ULONG)min(bytes_left, user_write_buffer_size);
             write_op.Buffer.Data = input_buf + input_buf_bytes_read;
             write_op.Buffer.Size = bytes_to_write;
@@ -1466,10 +1468,14 @@ HRESULT HandleGetInputMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_co
     // we have some buffered data
     if (input_buf_bytes_written) {
         write_op.Buffer.Data = input_buf + input_buf_bytes_read;
-        write_op.Buffer.Size = (ULONG)min(input_buf_bytes_written - input_buf_bytes_read, user_write_buffer_size);
+        size_t byte_count = input_buf_bytes_written - input_buf_bytes_read;
+        Assert( byte_count < ULONG_MAX );
+        write_op.Buffer.Size = (ULONG)min(byte_count, user_write_buffer_size);
     } else {
         if (!vt_input_enabled) {
-            input_msg->NumRecords = (ULONG)min(user_write_buffer_size / sizeof(INPUT_RECORD), write_ptr - read_ptr);
+            intptr_t record_count = write_ptr - read_ptr;
+            Assert( record_count < ULONG_MAX );
+            input_msg->NumRecords = (ULONG)min(user_write_buffer_size / sizeof(INPUT_RECORD), record_count);
             ULONG bytes = sizeof(INPUT_RECORD) * input_msg->NumRecords;
 
             write_op.Buffer.Data = read_ptr;
@@ -1517,6 +1523,7 @@ HRESULT HandleGetInputMessage(PCONSOLE_API_MSG ReceiveMsg, PCD_IO_COMPLETE io_co
                 read_ptr++;
             }
             write_op.Buffer.Data = input_buf;
+            Assert( input_buf_bytes_written < ULONG_MAX );
             write_op.Buffer.Size = (ULONG)min(input_buf_bytes_written, user_write_buffer_size);
         }
     }
@@ -1716,7 +1723,7 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
 
             if (data.ConsoleApp) {
                 CONSOLE_PROCESS_INFO cpi;
-                // TODO[oscar] Should we hash this instead?
+                Assert( ReceiveMsg.Descriptor.Process < ULONG_MAX );
                 cpi.dwProcessID = (DWORD)ReceiveMsg.Descriptor.Process;
                 cpi.dwFlags = CPI_NEWPROCESSWINDOW;
 
@@ -1896,9 +1903,13 @@ DWORD WINAPI ConsoleIoThread(LPVOID lpParameter)
                     PINPUT_RECORD write_ptr = pending_events_write_ptr;
                     PINPUT_RECORD read_ptr = pending_events_read_ptr;
                     if (read_ptr <= write_ptr) {
-                        get_input_cnt_msg->ReadyEvents = (ULONG)(write_ptr - read_ptr);
+                        intptr_t record_count = write_ptr - read_ptr;
+                        Assert( record_count < ULONG_MAX );
+                        get_input_cnt_msg->ReadyEvents = (ULONG)record_count;
                     } else {
-                        get_input_cnt_msg->ReadyEvents = (ULONG)((pending_events_wrap_ptr - read_ptr) + (write_ptr - pending_events));
+                        intptr_t record_count = (pending_events_wrap_ptr - read_ptr) + (write_ptr - pending_events);
+                        Assert( record_count < ULONG_MAX );
+                        get_input_cnt_msg->ReadyEvents = (ULONG)record_count;
                     }
                     io_complete.IoStatus.Status = STATUS_SUCCESS;
                     break;
@@ -2194,6 +2205,7 @@ static LRESULT CALLBACK WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lPa
             key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
             key_event.Event.KeyEvent.bKeyDown = !((lParam >> 31) & 1); // if bit 31 is set, char is being released
             key_event.Event.KeyEvent.wRepeatCount = LOWORD(lParam);
+            Assert( wParam < WCHAR_MAX );
             key_event.Event.KeyEvent.uChar.UnicodeChar = (WCHAR)wParam;
             key_event.Event.KeyEvent.dwControlKeyState = GetControlKeysState();
             PushEvent(key_event);
@@ -2797,7 +2809,7 @@ int WINAPI WinMain(
             frames++;
         }
 
-        BOOL vsync = TRUE;
+        BOOL vsync = FALSE;
         hr = swapChain->Present(vsync ? 1 : 0, 0);
         if (hr == DXGI_STATUS_OCCLUDED)
         {
