@@ -421,7 +421,7 @@ void RendererDraw(TermOutputBuffer* Terminal, uint32_t Width, uint32_t Height, u
             {
                 .CellSize = { GlyphGen->FontWidth, GlyphGen->FontHeight },
                 .TermSize = { Terminal->size.X, Terminal->size.Y },
-                .TopLeftMargin = {8, 8},
+                .TopLeftMargin = {0, 0},
                 .BlinkModulate = BlinkModulate,
                 .MarginColor = 0x000c0c0c,
 
