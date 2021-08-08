@@ -2408,6 +2408,26 @@ RefreshFont(TermOutputBuffer* Terminal)
     return Result;
 }
 
+typedef BOOL WINAPI set_process_dpi_aware(void);
+typedef BOOL WINAPI set_process_dpi_awareness_context(DPI_AWARENESS_CONTEXT);
+static void PreventWindowsDPIScaling()
+{
+    HMODULE WinUser = LoadLibraryW(L"user32.dll");
+    set_process_dpi_awareness_context* SetProcessDPIAwarenessContext = (set_process_dpi_awareness_context*)GetProcAddress(WinUser, "SetProcessDPIAwarenessContext");
+    if (SetProcessDPIAwarenessContext)
+    {
+        SetProcessDPIAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+    }
+    else
+    {
+        set_process_dpi_aware* SetProcessDPIAware = (set_process_dpi_aware*)GetProcAddress(WinUser, "SetProcessDPIAware");
+        if (SetProcessDPIAware)
+        {
+            SetProcessDPIAware();
+        }
+    }
+}
+
 int WINAPI WinMain(
     _In_ HINSTANCE hInstance,
     _In_opt_ HINSTANCE hPrevInstance,
@@ -2415,6 +2435,7 @@ int WINAPI WinMain(
     _In_ int nShowCmd
 )
 {
+    PreventWindowsDPIScaling();
     HRESULT hr;
 
     window_ready_event = CreateEventExW(0, 0, 0, EVENT_ALL_ACCESS);
@@ -2497,8 +2518,6 @@ int WINAPI WinMain(
             if (NewDimX > frontbuffer.REFTERM_MAX_WIDTH) NewDimX = frontbuffer.REFTERM_MAX_WIDTH;
             if (NewDimY > frontbuffer.REFTERM_MAX_HEIGHT) NewDimY = frontbuffer.REFTERM_MAX_HEIGHT;
 
-            // TODO(casey): Maybe only allocate on size differences,
-            // etc. Make a real resize function here for people who care.
             if ((frontbuffer.size.X != NewDimX) ||
                 (frontbuffer.size.Y != NewDimY))
             {
