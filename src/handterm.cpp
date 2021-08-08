@@ -2137,17 +2137,33 @@ static LRESULT CALLBACK WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lPa
         }
     case WM_CHAR:
         {
-            INPUT_RECORD key_event;
-            key_event.EventType = KEY_EVENT;
-            key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(keydown_msg.wParam);
-            key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
-            key_event.Event.KeyEvent.bKeyDown = !((lParam >> 31) & 1); // if bit 31 is set, char is being released
-            key_event.Event.KeyEvent.wRepeatCount = LOWORD(lParam);
-            Assert( wParam < WCHAR_MAX );
-            key_event.Event.KeyEvent.uChar.UnicodeChar = (WCHAR)wParam;
-            key_event.Event.KeyEvent.dwControlKeyState = GetControlKeysState();
-            PushEvent(key_event);
-            SetEvent(delayed_io_event);
+            bool store_event = true;
+            // ctrl+c
+            // todo: check if we still need WM_KEYUP/DOWN code
+            if (wParam == 0x03) {
+                FastFast_LockTerminal();
+                if (input_console_mode & ENABLE_PROCESSED_INPUT) {
+                    SendCtrlEventToAllProcesses(CTRL_C_EVENT, CONSOLE_CTRL_CLOSE_FLAG);
+                    // EndTask CTRL_C_EVENT
+                    if (!has_pending_line_read) {
+                        store_event = false;
+                    }
+                }
+                FastFast_UnlockTerminal();
+            }
+            if (store_event) {
+                INPUT_RECORD key_event;
+                key_event.EventType = KEY_EVENT;
+                key_event.Event.KeyEvent.wVirtualKeyCode = LOWORD(keydown_msg.wParam);
+                key_event.Event.KeyEvent.wVirtualScanCode = LOBYTE(HIWORD(keydown_msg.lParam));
+                key_event.Event.KeyEvent.bKeyDown = !((lParam >> 31) & 1); // if bit 31 is set, char is being released
+                key_event.Event.KeyEvent.wRepeatCount = LOWORD(lParam);
+                Assert(wParam < WCHAR_MAX);
+                key_event.Event.KeyEvent.uChar.UnicodeChar = (WCHAR)wParam;
+                key_event.Event.KeyEvent.dwControlKeyState = GetControlKeysState();
+                PushEvent(key_event);
+                SetEvent(delayed_io_event);
+            }
             return 0;
         }
     case WM_SIZE:
