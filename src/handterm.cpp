@@ -968,7 +968,7 @@ void FastFast_UpdateTerminalW(TermOutputBuffer& tb, const wchar_t* str, SIZE_T c
                                     (run_t - 1)->attr.soft_wrap = true;
                                     size_t cells_to_skip = size.X - run_pos.X;
                                     clear_buffer_cells(&tb, run_t, cells_to_skip);
-                                    run_t += cells_to_skip;
+                                    run_t = check_wrap(&tb, run_t + cells_to_skip);
                                     run_pos.X = 0;
                                     run_pos.Y++;
                                 } else if (GlyphDim.TileCount >= size.X) {
@@ -2292,7 +2292,7 @@ DWORD WINAPI WindowThread(LPVOID lpParameter) {
     DWORD exstyle = WS_EX_APPWINDOW;
     DWORD style = WS_OVERLAPPEDWINDOW | WS_VSCROLL;
 
-    window = CreateWindowExW(exstyle, wc.lpszClassName, L"Handterm", style, CW_USEDEFAULT, CW_USEDEFAULT, 640, 640, NULL, NULL, wc.hInstance, NULL);
+    window = CreateWindowExW(exstyle, wc.lpszClassName, L"Handterm", style, CW_USEDEFAULT, CW_USEDEFAULT, 568, 640, NULL, NULL, wc.hInstance, NULL);
     Assert(window);
     // show the window
     ShowWindow(window, SW_SHOWDEFAULT);
