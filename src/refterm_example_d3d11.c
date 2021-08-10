@@ -3,9 +3,12 @@
 // have some should go through this and give advice about if there are any things
 // that should be done differently in production code.
 #include "refterm_example_d3d11.h"
-#include "refterm_cs.h"
-#include "refterm_ps.h"
-#include "refterm_vs.h"
+
+// these should be generated from hlsl shader in pre-build step
+#include "shader/refterm_cs.h"
+#include "shader/refterm_ps.h"
+#include "shader/refterm_vs.h"
+
 #include "terminal.h"
 #include "shared.h"
 

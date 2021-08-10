@@ -25,14 +25,11 @@
     <ClInclude Include="src\conmsgl1.h" />
     <ClInclude Include="src\conmsgl2.h" />
     <ClInclude Include="src\conmsgl3.h" />
-    <ClInclude Include="src\refterm_cs.h" />
     <ClInclude Include="src\refterm_example_d3d11.h" />
     <ClInclude Include="src\refterm_example_dwrite.h" />
     <ClInclude Include="src\refterm_example_glyph_generator.h" />
     <ClInclude Include="src\refterm_example_source_buffer.h" />
     <ClInclude Include="src\refterm_glyph_cache.h" />
-    <ClInclude Include="src\refterm_ps.h" />
-    <ClInclude Include="src\refterm_vs.h" />
     <ClInclude Include="src\shared.h" />
     <ClInclude Include="src\terminal.h" />
     <ClInclude Include="src\vtparser.h" />
@@ -111,6 +108,7 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
+    <CustomBuildBeforeTargets>PreBuildEvent</CustomBuildBeforeTargets>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
@@ -173,6 +171,19 @@
       <ShaderType>Effect</ShaderType>
       <ShaderModel>5.0</ShaderModel>
     </FxCompile>
+    <CustomBuildStep>
+      <Command>cd $(ProjectDir)src
+call fxc /nologo /T cs_5_0 /E ComputeMain /O3 /WX /Fh shader/refterm_cs.h /Vn ReftermCSShaderBytes /Qstrip_reflect /Qstrip_debug /Qstrip_priv refterm.hlsl
+call fxc /nologo /T ps_5_0 /E PixelMain /O3 /WX /Fh shader/refterm_ps.h /Vn ReftermPSShaderBytes /Qstrip_reflect /Qstrip_debug /Qstrip_priv refterm.hlsl
+call fxc /nologo /T vs_5_0 /E VertexMain /O3 /WX /Fh shader/refterm_vs.h /Vn ReftermVSShaderBytes /Qstrip_reflect /Qstrip_debug /Qstrip_priv refterm.hlsl</Command>
+    </CustomBuildStep>
+    <CustomBuildStep>
+      <Outputs>$(ProjectDir)src\refterm_cs.h;$(ProjectDir)src\refterm_ps.h;$(ProjectDir)src\refterm_vs.h;%(Outputs)</Outputs>
+    </CustomBuildStep>
+    <CustomBuildStep>
+      <Inputs>$(ProjectDir)src\refterm.hlsl;%(Inputs)</Inputs>
+      <Message>Build shaders</Message>
+    </CustomBuildStep>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -197,7 +208,10 @@
     </FxCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <FxCompile Include="src\refterm.hlsl" />
+    <FxCompile Include="src\refterm.hlsl">
+      <HeaderFileOutput Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+      </HeaderFileOutput>
+    </FxCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
