@@ -9,14 +9,11 @@
     <ClInclude Include="src\conmsgl3.h" />
     <ClInclude Include="src\shared.h" />
     <ClInclude Include="src\vtparser.h" />
-    <ClInclude Include="src\refterm_cs.h" />
     <ClInclude Include="src\refterm_example_d3d11.h" />
     <ClInclude Include="src\refterm_example_dwrite.h" />
     <ClInclude Include="src\refterm_example_glyph_generator.h" />
     <ClInclude Include="src\refterm_example_source_buffer.h" />
     <ClInclude Include="src\refterm_glyph_cache.h" />
-    <ClInclude Include="src\refterm_ps.h" />
-    <ClInclude Include="src\refterm_vs.h" />
     <ClInclude Include="src\terminal.h" />
   </ItemGroup>
   <ItemGroup>

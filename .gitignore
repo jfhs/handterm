@@ -5,3 +5,4 @@ x64
 *.vim
 *.swp
 *.vcxproj.user
+src/shader/*.h
