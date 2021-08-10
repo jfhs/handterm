@@ -112,6 +112,7 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
+    <CustomBuildBeforeTargets>PreBuildEvent</CustomBuildBeforeTargets>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -206,6 +207,21 @@ call fxc /nologo /T vs_5_0 /E VertexMain /O3 /WX /Fh shader/refterm_vs.h /Vn Ref
     <FxCompile>
       <ShaderModel>5.0</ShaderModel>
     </FxCompile>
+    <CustomBuildStep>
+      <Command>cd $(ProjectDir)src
+call fxc /nologo /T cs_5_0 /E ComputeMain /O3 /WX /Fh shader/refterm_cs.h /Vn ReftermCSShaderBytes /Qstrip_reflect /Qstrip_debug /Qstrip_priv refterm.hlsl
+call fxc /nologo /T ps_5_0 /E PixelMain /O3 /WX /Fh shader/refterm_ps.h /Vn ReftermPSShaderBytes /Qstrip_reflect /Qstrip_debug /Qstrip_priv refterm.hlsl
+call fxc /nologo /T vs_5_0 /E VertexMain /O3 /WX /Fh shader/refterm_vs.h /Vn ReftermVSShaderBytes /Qstrip_reflect /Qstrip_debug /Qstrip_priv refterm.hlsl</Command>
+    </CustomBuildStep>
+    <CustomBuildStep>
+      <Message>Build shaders</Message>
+    </CustomBuildStep>
+    <CustomBuildStep>
+      <Outputs>$(ProjectDir)src\shader\refterm_cs.h;$(ProjectDir)src\shader\refterm_ps.h;$(ProjectDir)src\shader\refterm_vs.h;%(Outputs)</Outputs>
+    </CustomBuildStep>
+    <CustomBuildStep>
+      <Inputs>$(ProjectDir)src\refterm.hlsl;%(Inputs)</Inputs>
+    </CustomBuildStep>
   </ItemDefinitionGroup>
   <ItemGroup>
     <FxCompile Include="src\refterm.hlsl">
